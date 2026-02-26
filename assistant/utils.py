@@ -117,3 +117,50 @@ def normalize_keywords(keywords: list[str]) -> list[str]:
 
 def short_json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False)
+
+
+_SECRET_KEY_RE = re.compile(
+    r"(api[_-]?key|token|secret|password|passwd|authorization|bearer|access[_-]?key)",
+    re.IGNORECASE,
+)
+
+
+def redact_secrets_text(text: str) -> str:
+    if not text:
+        return text
+
+    out = text
+    # KEY=value style
+    out = re.sub(
+        r"(?im)^(\s*[A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|ACCESS_KEY)[A-Z0-9_]*\s*=\s*)(.+)\s*$",
+        r"\1***REDACTED***",
+        out,
+    )
+    # JSON-like "key": "value"
+    out = re.sub(
+        r'(?i)"([^"]*(?:api[_-]?key|token|secret|password|passwd|authorization|bearer|access[_-]?key)[^"]*)"\s*:\s*"([^"]*)"',
+        r'"\1":"***REDACTED***"',
+        out,
+    )
+    # Bearer tokens in free text
+    out = re.sub(r"(?i)\b(Bearer)\s+[A-Za-z0-9._\-=/+]+", r"\1 ***REDACTED***", out)
+    # sk- style keys
+    out = re.sub(r"\b(sk-[A-Za-z0-9][A-Za-z0-9_\-]{10,})\b", "***REDACTED***", out)
+    return out
+
+
+def redact_secrets_obj(data: Any) -> Any:
+    if isinstance(data, dict):
+        redacted = {}
+        for k, v in data.items():
+            key = str(k)
+            if _SECRET_KEY_RE.search(key):
+                redacted[k] = "***REDACTED***"
+            else:
+                redacted[k] = redact_secrets_obj(v)
+        return redacted
+    if isinstance(data, list):
+        return [redact_secrets_obj(x) for x in data]
+    if isinstance(data, str):
+        return redact_secrets_text(data)
+    return data

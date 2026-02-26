@@ -6,19 +6,37 @@ from typing import Any, Callable
 from .functions_registry import FunctionRegistry
 from .memory import MemoryStore
 from .utils import normalize_keywords
-from .web import extract_code_snippets, search_web
+from .web import extract_code_snippets, read_web, scrape_web, search_web
+from .workspace_tools import WorkspaceTools
 
 
 class ToolSystem:
-    def __init__(self, memory_store: MemoryStore, function_registry: FunctionRegistry) -> None:
+    def __init__(
+        self,
+        memory_store: MemoryStore,
+        function_registry: FunctionRegistry,
+        workspace_tools: WorkspaceTools,
+    ) -> None:
         self.memory_store = memory_store
         self.function_registry = function_registry
+        self.workspace_tools = workspace_tools
         self._tools: dict[str, Callable[..., Any]] = {
             "find_in_memory": self.find_in_memory,
             "create_block": self.create_block,
             "create_function": self.create_function,
             "search_web": self.search_web,
+            "read_web": self.read_web,
+            "scrape_web": self.scrape_web,
             "extract_code_snippets": self.extract_code_snippets,
+            "list_files": self.list_files,
+            "read_file": self.read_file,
+            "write_file": self.write_file,
+            "edit_file": self.edit_file,
+            "create_plan": self.create_plan,
+            "list_plans": self.list_plans,
+            "get_plan": self.get_plan,
+            "add_todo": self.add_todo,
+            "update_todo": self.update_todo,
         }
 
     def tool_names(self) -> list[str]:
@@ -205,3 +223,99 @@ class ToolSystem:
 
     def extract_code_snippets(self, html: str) -> dict[str, Any]:
         return {"ok": True, "snippets": extract_code_snippets(html)}
+
+    def read_web(
+        self,
+        url: str,
+        timeout: int = 12,
+        max_chars: int = 12000,
+        include_links: bool = True,
+        max_links: int = 120,
+    ) -> dict[str, Any]:
+        return read_web(
+            url=url,
+            timeout=timeout,
+            max_chars=max_chars,
+            include_links=include_links,
+            max_links=max_links,
+        )
+
+    def scrape_web(
+        self,
+        start_url: str,
+        max_pages: int = 20,
+        max_depth: int = 2,
+        same_domain_only: bool = True,
+        include_external: bool = False,
+        timeout: int = 10,
+        max_links_per_page: int = 120,
+    ) -> dict[str, Any]:
+        return scrape_web(
+            start_url=start_url,
+            max_pages=max_pages,
+            max_depth=max_depth,
+            same_domain_only=same_domain_only,
+            include_external=include_external,
+            timeout=timeout,
+            max_links_per_page=max_links_per_page,
+        )
+
+    def list_files(
+        self,
+        path: str = ".",
+        glob: str = "**/*",
+        include_hidden: bool = False,
+        max_entries: int = 200,
+    ) -> dict[str, Any]:
+        return self.workspace_tools.list_files(
+            path=path,
+            glob=glob,
+            include_hidden=include_hidden,
+            max_entries=max_entries,
+        )
+
+    def read_file(
+        self,
+        path: str,
+        start_line: int = 1,
+        end_line: int | None = None,
+        max_chars: int = 12000,
+    ) -> dict[str, Any]:
+        return self.workspace_tools.read_file(
+            path=path,
+            start_line=start_line,
+            end_line=end_line,
+            max_chars=max_chars,
+        )
+
+    def write_file(self, path: str, content: str, append: bool = False) -> dict[str, Any]:
+        return self.workspace_tools.write_file(path=path, content=content, append=append)
+
+    def edit_file(
+        self,
+        path: str,
+        find_text: str,
+        replace_text: str,
+        replace_all: bool = False,
+    ) -> dict[str, Any]:
+        return self.workspace_tools.edit_file(
+            path=path,
+            find_text=find_text,
+            replace_text=replace_text,
+            replace_all=replace_all,
+        )
+
+    def create_plan(self, title: str, goal: str, steps: list[str]) -> dict[str, Any]:
+        return self.workspace_tools.create_plan(title=title, goal=goal, steps=steps)
+
+    def list_plans(self) -> dict[str, Any]:
+        return self.workspace_tools.list_plans()
+
+    def get_plan(self, plan_id: str) -> dict[str, Any]:
+        return self.workspace_tools.get_plan(plan_id=plan_id)
+
+    def add_todo(self, plan_id: str, text: str) -> dict[str, Any]:
+        return self.workspace_tools.add_todo(plan_id=plan_id, text=text)
+
+    def update_todo(self, plan_id: str, todo_id: int, status: str) -> dict[str, Any]:
+        return self.workspace_tools.update_todo(plan_id=plan_id, todo_id=todo_id, status=status)

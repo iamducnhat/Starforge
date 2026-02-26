@@ -4,7 +4,7 @@ import html
 import math
 import re
 from typing import Any
-from urllib.parse import parse_qs, quote_plus, urlparse
+from urllib.parse import parse_qs, quote_plus, urldefrag, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -48,6 +48,47 @@ def _extract_page_text(html_text: str, max_chars: int = 2200) -> str:
     if not text:
         return ""
     return text[:max_chars].strip()
+
+
+def _extract_title(html_text: str) -> str:
+    if not html_text:
+        return ""
+    m = re.search(r"<title[^>]*>(.*?)</title>", html_text, flags=re.IGNORECASE | re.DOTALL)
+    if not m:
+        return ""
+    return _strip_tags(m.group(1)).strip()
+
+
+def _canonicalize_url(url: str, base_url: str | None = None) -> str:
+    u = url.strip()
+    if not u:
+        return ""
+    if base_url:
+        u = urljoin(base_url, u)
+    u, _frag = urldefrag(u)
+    parsed = urlparse(u)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return ""
+    if not parsed.netloc:
+        return ""
+    return u
+
+
+def _extract_links(html_text: str, base_url: str, max_links: int = 200) -> list[str]:
+    if not html_text:
+        return []
+    href_pattern = re.compile(r'<a[^>]*href=["\'](.*?)["\']', re.IGNORECASE | re.DOTALL)
+    out: list[str] = []
+    seen: set[str] = set()
+    for href in href_pattern.findall(html_text):
+        url = _canonicalize_url(href, base_url=base_url)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append(url)
+        if len(out) >= max_links:
+            break
+    return out
 
 
 def _complex_query(query: str) -> bool:
@@ -272,6 +313,107 @@ def search_web(
             "page_timeout": page_timeout_eff,
             "had_search_error": bool(search_meta.get("had_error", False)),
         },
+    }
+
+
+def read_web(
+    url: str,
+    timeout: int = 12,
+    max_chars: int = 12000,
+    include_links: bool = True,
+    max_links: int = 120,
+) -> dict[str, Any]:
+    target = _canonicalize_url(url)
+    if not target:
+        return {"ok": False, "error": "invalid url"}
+    try:
+        html_text = _http_get(target, timeout=timeout)
+        text = _extract_page_text(html_text, max_chars=max_chars)
+        result: dict[str, Any] = {
+            "ok": True,
+            "url": target,
+            "title": _extract_title(html_text),
+            "text": text,
+            "code_snippets": extract_code_snippets(html_text, max_snippets=8, max_chars=700),
+        }
+        if include_links:
+            result["links"] = _extract_links(html_text, base_url=target, max_links=max_links)
+        return result
+    except Exception as e:
+        return {"ok": False, "url": target, "error": str(e)}
+
+
+def scrape_web(
+    start_url: str,
+    max_pages: int = 20,
+    max_depth: int = 2,
+    same_domain_only: bool = True,
+    include_external: bool = False,
+    timeout: int = 10,
+    max_links_per_page: int = 120,
+) -> dict[str, Any]:
+    root = _canonicalize_url(start_url)
+    if not root:
+        return {"ok": False, "error": "invalid start_url"}
+
+    root_domain = urlparse(root).netloc.lower()
+    max_pages = max(1, min(max_pages, 200))
+    max_depth = max(0, min(max_depth, 6))
+
+    queue: list[tuple[str, int]] = [(root, 0)]
+    visited: set[str] = set()
+    pages: list[dict[str, Any]] = []
+    all_links: set[str] = set()
+
+    while queue and len(visited) < max_pages:
+        current, depth = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+
+        try:
+            html_text = _http_get(current, timeout=timeout)
+            links = _extract_links(html_text, base_url=current, max_links=max_links_per_page)
+            all_links.update(links)
+
+            page_record = {
+                "url": current,
+                "depth": depth,
+                "title": _extract_title(html_text),
+                "excerpt": _extract_page_text(html_text, max_chars=1500),
+                "links_count": len(links),
+                "links": links,
+            }
+            pages.append(page_record)
+
+            if depth < max_depth:
+                for link in links:
+                    link_domain = urlparse(link).netloc.lower()
+                    same_domain = link_domain == root_domain
+                    if same_domain_only and not same_domain:
+                        continue
+                    if not include_external and not same_domain:
+                        continue
+                    if link not in visited:
+                        queue.append((link, depth + 1))
+        except Exception as e:
+            pages.append(
+                {
+                    "url": current,
+                    "depth": depth,
+                    "error": str(e),
+                    "links_count": 0,
+                    "links": [],
+                }
+            )
+
+    return {
+        "ok": True,
+        "start_url": root,
+        "domain": root_domain,
+        "visited_pages": len(visited),
+        "pages": pages,
+        "unique_links": sorted(all_links),
     }
 
 

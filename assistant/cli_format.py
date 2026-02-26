@@ -5,6 +5,8 @@ import re
 import sys
 from typing import Any
 
+from .utils import redact_secrets_obj, redact_secrets_text
+
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -133,7 +135,7 @@ def extract_answer_text(response: str) -> str:
 
 
 def _print_markdown(text: str) -> None:
-    rendered = _render_markdown(text)
+    rendered = _render_markdown(redact_secrets_text(text))
     if not rendered:
         sys.stdout.write("\n")
         sys.stdout.flush()
@@ -316,10 +318,19 @@ class StreamRenderer:
 
 
 def print_tool_event(name: str, args: dict[str, Any], result: dict[str, Any]) -> None:
-    args_text = json.dumps(args, ensure_ascii=False)
-    result_text = json.dumps(result, ensure_ascii=False)
+    safe_args = redact_secrets_obj(args)
+    safe_result = redact_secrets_obj(result)
+    args_text = json.dumps(safe_args, ensure_ascii=False)
+    result_text = json.dumps(safe_result, ensure_ascii=False)
     if len(result_text) > 420:
         result_text = result_text[:417] + "..."
     print(f"{BOLD}{MAGENTA}tool>{RESET} {TOOL_LABEL}{name}{RESET}")
     print(f"{DIM}{BLUE}args:{RESET} {args_text}")
     print(f"{DIM}{BLUE}result:{RESET} {result_text}")
+
+
+def print_tool_start(name: str, args: dict[str, Any]) -> None:
+    safe_args = redact_secrets_obj(args)
+    args_text = json.dumps(safe_args, ensure_ascii=False)
+    print(f"{BOLD}{MAGENTA}tool>{RESET} {TOOL_LABEL}{name}{RESET} {DIM}(start){RESET}")
+    print(f"{DIM}{BLUE}args:{RESET} {args_text}")

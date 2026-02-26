@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# macOS
+.DS_Store
+
+# Local editor/project settings
+.vscode/
+
+# Secrets / local config
+.env
+
+# Runtime/generated logs
+memory/tool_finetune_samples.jsonl
+memory/tool_supervision.jsonl
+memory/plans/*.json
+
+# Optional local virtual envs
+.venv/
+venv/
+env/

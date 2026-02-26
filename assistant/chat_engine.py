@@ -7,10 +7,11 @@ from datetime import datetime, timezone
 from typing import Any
 from collections.abc import Callable
 
-from .cli_format import StreamRenderer, extract_answer_text, print_answer_only, print_formatted_output, print_tool_event
+from .cli_format import StreamRenderer, extract_answer_text, print_answer_only, print_formatted_output, print_tool_event, print_tool_start
 from .model import BaseModel
 from .tool_calls import parse_tool_calls
 from .tools import ToolSystem
+from .utils import parse_json_payload
 
 
 class ChatEngine:
@@ -21,15 +22,20 @@ class ChatEngine:
         system_prompt: str,
         max_history: int = 14,
         max_tool_rounds: int = 4,
+        autonomous_enabled: bool = False,
+        autonomous_steps: int = 6,
     ) -> None:
         self.model = model
         self.tools = tools
         self.system_prompt = system_prompt
         self.max_history = max_history
         self.max_tool_rounds = max_tool_rounds
+        self.autonomous_enabled = autonomous_enabled
+        self.autonomous_steps = max(1, min(autonomous_steps, 30))
         self.history: list[dict[str, str]] = []
         self.supervision_log = Path("memory/tool_supervision.jsonl")
         self.tool_finetune_log = Path("memory/tool_finetune_samples.jsonl")
+        self._intent_cache: dict[str, dict[str, Any]] = {}
 
     def _generate_with_stream_fallback(self, messages: list[dict[str, str]]) -> str:
         text = self.model.generate(messages)
@@ -190,23 +196,8 @@ class ChatEngine:
             ),
         }
 
-    @staticmethod
-    def _explicit_store_request(user_message: str) -> bool:
-        t = user_message.lower()
-        markers = (
-            "save as function",
-            "store as function",
-            "register function",
-            "persist function",
-            "create_function",
-            "save this function",
-            "store this function",
-            "add to functions",
-            "put in functions",
-            "save reusable function",
-            "store reusable function",
-        )
-        return any(m in t for m in markers)
+    def _explicit_store_request(self, user_message: str) -> bool:
+        return bool(self._intent_flags(user_message).get("store_request", False))
 
     def _prefer_copyable_function_reply(self, user_message: str) -> bool:
         return self._requires_presearch_for_code(user_message) and not self._explicit_store_request(user_message)
@@ -272,35 +263,44 @@ class ChatEngine:
                 break
         return out or ["general"]
 
-    @staticmethod
-    def _looks_coding_request(text: str) -> bool:
-        t = text.lower()
-        markers = (
-            "python",
-            "javascript",
-            "typescript",
-            "java",
-            "go ",
-            "rust",
-            "code",
-            "class",
-            "function",
-            "exception",
-            "stack trace",
-            "debug",
-            "bug",
-            "test",
-            "api",
-            "sql",
-        )
-        return any(m in t for m in markers)
+    def _looks_coding_request(self, text: str) -> bool:
+        return bool(self._intent_flags(text).get("coding", False))
 
-    @staticmethod
-    def _looks_smalltalk(text: str) -> bool:
-        t = re.sub(r"\s+", " ", text.strip().lower())
-        if not t:
-            return True
-        exact = {
+    def _looks_smalltalk(self, text: str) -> bool:
+        return bool(self._intent_flags(text).get("smalltalk", False))
+
+    def _looks_creative_request(self, text: str) -> bool:
+        return bool(self._intent_flags(text).get("creative", False))
+
+    def _looks_personal_or_companion_chat(self, text: str) -> bool:
+        return bool(self._intent_flags(text).get("companion", False))
+
+    def _heuristic_intent_flags(self, user_message: str) -> dict[str, Any]:
+        t = user_message.lower()
+        compact = re.sub(r"\s+", " ", user_message.strip().lower())
+
+        coding = any(
+            m in t
+            for m in (
+                "python",
+                "javascript",
+                "typescript",
+                "java",
+                "go ",
+                "rust",
+                "code",
+                "class",
+                "function",
+                "exception",
+                "stack trace",
+                "debug",
+                "bug",
+                "test",
+                "api",
+                "sql",
+            )
+        )
+        smalltalk_exact = {
             "hi",
             "hello",
             "hey",
@@ -314,60 +314,246 @@ class ChatEngine:
             "let's code",
             "lets code",
         }
-        if t in exact:
-            return True
-        return len(t.split()) <= 2 and all(w in {"hi", "hello", "hey", "thanks", "ok", "okay"} for w in t.split())
-
-    @staticmethod
-    def _looks_creative_request(text: str) -> bool:
-        t = text.lower()
-        markers = (
-            "write a poem",
-            "poem",
-            "story",
-            "joke",
-            "translate",
-            "rewrite this",
-            "paraphrase",
+        smalltalk = compact in smalltalk_exact or (
+            len(compact.split()) <= 2 and all(w in {"hi", "hello", "hey", "thanks", "ok", "okay"} for w in compact.split())
         )
-        return any(m in t for m in markers)
+        creative = any(m in t for m in ("write a poem", "poem", "story", "joke", "translate", "rewrite this", "paraphrase"))
+        companion = any(
+            m in t
+            for m in (
+                "be my partner",
+                "be my girlfriend",
+                "be my boyfriend",
+                "chat with me",
+                "talk with me",
+                "keep me company",
+                "can you stay with me",
+                "can you be with me",
+            )
+        )
+        store_request = any(
+            m in t
+            for m in (
+                "save as function",
+                "store as function",
+                "register function",
+                "persist function",
+                "create_function",
+                "save this function",
+                "store this function",
+                "add to functions",
+                "put in functions",
+                "save reusable function",
+                "store reusable function",
+            )
+        )
+        code_generation = any(
+            m in t
+            for m in (
+                "create function",
+                "write function",
+                "my own function",
+                "their own function",
+                "create your own function",
+                "custom function",
+                "implement function",
+                "build function",
+                "create a function",
+                "write code",
+                "implement code",
+                "download file",
+                "read research",
+                "parse paper",
+            )
+        )
+        workspace_edit = any(
+            m in t
+            for m in (
+                "read file",
+                "read files",
+                "open file",
+                "edit file",
+                "update file",
+                "modify file",
+                "refactor",
+                "fix bug",
+                "fix this",
+                "in this project",
+                "in this repo",
+                "codebase",
+                "make plan",
+                "todo",
+                "to-do",
+            )
+        ) or bool(self._extract_explicit_file_paths(user_message))
+        factual = any(
+            m in t
+            for m in (
+                "what",
+                "who",
+                "when",
+                "where",
+                "which",
+                "why",
+                "latest",
+                "current",
+                "today",
+                "news",
+                "learn more",
+                "about",
+                "overview",
+                "explain",
+                "recommend",
+                "best",
+            )
+        ) or ("?" in t and len(t.split()) >= 8)
+        if coding or smalltalk or creative or companion:
+            factual = False
+
+        return {
+            "coding": coding,
+            "smalltalk": smalltalk,
+            "creative": creative,
+            "companion": companion,
+            "factual": factual,
+            "workspace_edit": workspace_edit,
+            "code_generation": code_generation,
+            "store_request": store_request,
+            "optimized_query": "",
+        }
+
+    def _ai_intent_flags(self, user_message: str) -> dict[str, Any]:
+        prompt = (
+            "Classify user intent and optimize search query.\n"
+            "Return JSON only with keys:\n"
+            "coding, smalltalk, creative, companion, factual, workspace_edit, code_generation, store_request, optimized_query.\n"
+            "Booleans for all flags. optimized_query should be concise and high-signal for web search.\n"
+            "If no web search is needed, optimized_query can be empty.\n"
+            f"User: {user_message}"
+        )
+        try:
+            raw = self.model.generate(
+                [
+                    {"role": "system", "content": "You are an intent classifier. Return strict JSON only."},
+                    {"role": "user", "content": prompt},
+                ]
+            )
+            clean = self._strip_thinking(raw)
+            payload = parse_json_payload(clean)
+            if not isinstance(payload, dict):
+                return {}
+            out: dict[str, Any] = {}
+            for k in ("coding", "smalltalk", "creative", "companion", "factual", "workspace_edit", "code_generation", "store_request"):
+                if k in payload:
+                    out[k] = bool(payload[k])
+            q = payload.get("optimized_query", "")
+            if isinstance(q, str):
+                out["optimized_query"] = q.strip()
+            return out
+        except Exception:
+            return {}
+
+    def _intent_flags(self, user_message: str) -> dict[str, Any]:
+        key = user_message.strip()
+        if key in self._intent_cache:
+            return self._intent_cache[key]
+
+        heuristic = self._heuristic_intent_flags(user_message)
+        ai = self._ai_intent_flags(user_message)
+        merged = dict(heuristic)
+        for k, v in ai.items():
+            if k == "optimized_query":
+                if isinstance(v, str) and v:
+                    merged[k] = v
+            elif isinstance(v, bool):
+                merged[k] = v
+        self._intent_cache[key] = merged
+        return merged
 
     def _requires_web_presearch_for_factual(self, user_message: str) -> bool:
-        if self._looks_coding_request(user_message):
-            return False
-        if self._looks_smalltalk(user_message):
-            return False
-        if self._looks_creative_request(user_message):
-            return False
-
-        t = user_message.lower()
-        factual_markers = (
-            "?",
-            "what",
-            "who",
-            "when",
-            "where",
-            "which",
-            "why",
-            "latest",
-            "current",
-            "today",
-            "news",
-            "learn more",
-            "about",
-            "overview",
-            "explain",
-            "recommend",
-            "best",
-        )
-        return any(m in t for m in factual_markers)
+        flags = self._intent_flags(user_message)
+        return bool(flags.get("factual", False))
 
     def _presearch_tool_calls_for_factual(self, user_message: str) -> list[dict[str, Any]]:
         keywords = self._extract_keywords(user_message)
+        query = self._optimize_search_query(user_message)
         return [
             {"name": "find_in_memory", "args": {"keywords": keywords}},
-            {"name": "search_web", "args": {"query": user_message, "level": "auto"}},
+            {"name": "search_web", "args": {"query": query, "level": "auto"}},
         ]
+
+    def _optimize_search_query(self, user_message: str) -> str:
+        inferred = self._intent_flags(user_message).get("optimized_query", "")
+        if isinstance(inferred, str) and inferred.strip():
+            return inferred.strip()
+
+        raw = re.sub(r"\s+", " ", user_message.strip())
+        q = raw.lower()
+
+        # Remove low-signal conversational wrappers.
+        wrappers = (
+            "i want to learn more about",
+            "i want to know about",
+            "tell me about",
+            "can you tell me about",
+            "help me understand",
+            "i want to learn about",
+        )
+        for w in wrappers:
+            if q.startswith(w):
+                q = q[len(w) :].strip(" ,.-")
+                break
+
+        # Topic-specific normalization for better retrieval quality.
+        if any(k in q for k in ("sex", "sexual", "intimacy", "partner")):
+            return "how to improve sexual intimacy and communication with partner consent"
+
+        # Generic fallback: compact keywords from original user text.
+        keys = re.findall(r"[a-zA-Z0-9_]{3,}", q)
+        stop = {
+            "want",
+            "learn",
+            "more",
+            "about",
+            "please",
+            "help",
+            "tell",
+            "know",
+            "with",
+            "from",
+            "this",
+            "that",
+        }
+        compact = [k for k in keys if k not in stop]
+        if compact:
+            return " ".join(compact[:10])
+        return raw
+
+    @staticmethod
+    def _extract_explicit_file_paths(text: str, limit: int = 3) -> list[str]:
+        # Capture lightweight file-like mentions such as src/app.py or README.md
+        pattern = re.compile(r"([A-Za-z0-9_\-./]+\.[A-Za-z0-9_]{1,8})")
+        out: list[str] = []
+        seen = set()
+        for match in pattern.findall(text):
+            candidate = match.strip().strip(".,;:()[]{}\"'")
+            if not candidate or "/" in candidate and candidate.startswith("http"):
+                continue
+            if candidate not in seen:
+                out.append(candidate)
+                seen.add(candidate)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _requires_workspace_preinspect(self, user_message: str) -> bool:
+        return bool(self._intent_flags(user_message).get("workspace_edit", False))
+
+    def _preinspect_tool_calls_for_workspace(self, user_message: str) -> list[dict[str, Any]]:
+        calls: list[dict[str, Any]] = [{"name": "list_files", "args": {"path": ".", "max_entries": 200}}]
+        for p in self._extract_explicit_file_paths(user_message):
+            calls.append({"name": "read_file", "args": {"path": p, "max_chars": 6000}})
+        return calls
 
     def _ensure_web_call_for_factual(
         self,
@@ -379,7 +565,12 @@ class ChatEngine:
             return tool_calls
         if any(call.get("name") == "search_web" for call in tool_calls):
             return tool_calls
-        return tool_calls + [{"name": "search_web", "args": {"query": user_message, "level": "auto"}}]
+        return tool_calls + [
+            {
+                "name": "search_web",
+                "args": {"query": self._optimize_search_query(user_message), "level": "auto"},
+            }
+        ]
 
     def _emergency_tool_calls(self, user_message: str) -> list[dict[str, Any]]:
         keywords = self._extract_keywords(user_message)
@@ -388,26 +579,8 @@ class ChatEngine:
             calls.append({"name": "search_web", "args": {"query": user_message, "level": "auto"}})
         return calls
 
-    @staticmethod
-    def _requires_presearch_for_code(user_message: str) -> bool:
-        t = user_message.lower()
-        markers = (
-            "create function",
-            "write function",
-            "my own function",
-            "their own function",
-            "create your own function",
-            "custom function",
-            "implement function",
-            "build function",
-            "create a function",
-            "write code",
-            "implement code",
-            "download file",
-            "read research",
-            "parse paper",
-        )
-        return any(m in t for m in markers)
+    def _requires_presearch_for_code(self, user_message: str) -> bool:
+        return bool(self._intent_flags(user_message).get("code_generation", False))
 
     def _presearch_tool_calls_for_code(self, user_message: str) -> list[dict[str, Any]]:
         keywords = self._extract_keywords(user_message)
@@ -474,12 +647,12 @@ class ChatEngine:
         self,
         user_message: str,
         on_tool: Callable[[str, dict[str, object], dict[str, object]], None] | None = None,
+        on_tool_start: Callable[[str, dict[str, object]], None] | None = None,
     ) -> str:
         self.history.append({"role": "user", "content": user_message})
         continue_after_tools = False
         emergency_tools_used = False
         tools_executed_this_turn = False
-        web_search_executed_this_turn = False
         web_search_executed_this_turn = False
 
         for _ in range(self.max_tool_rounds):
@@ -549,7 +722,10 @@ class ChatEngine:
                             clean = assistant_text
                     presearch: list[dict[str, Any]] = []
                     event_name = ""
-                    if clean and self._requires_presearch_for_code(user_message) and not tools_executed_this_turn:
+                    if clean and self._requires_workspace_preinspect(user_message) and not tools_executed_this_turn:
+                        presearch = self._preinspect_tool_calls_for_workspace(user_message)
+                        event_name = "workspace_preinspect"
+                    elif clean and self._requires_presearch_for_code(user_message) and not tools_executed_this_turn:
                         presearch = self._presearch_tool_calls_for_code(user_message)
                         event_name = "presearch_for_code"
                     elif clean and self._requires_web_presearch_for_factual(user_message) and not web_search_executed_this_turn:
@@ -578,6 +754,8 @@ class ChatEngine:
             self._log_tool_training_sample(user_message=user_message, assistant_text=assistant_text, tool_calls=tool_calls)
 
             for call in tool_calls:
+                if on_tool_start:
+                    on_tool_start(call["name"], call.get("args", {}))
                 result = self._execute_tool_call_with_policy(user_message, call)
                 if on_tool:
                     on_tool(call["name"], call.get("args", {}), result)
@@ -606,12 +784,14 @@ class ChatEngine:
         user_message: str,
         on_chunk: Callable[[str], None],
         on_tool: Callable[[str, dict[str, object], dict[str, object]], None] | None = None,
+        on_tool_start: Callable[[str, dict[str, object]], None] | None = None,
         on_tool_phase: Callable[[], None] | None = None,
     ) -> str:
         self.history.append({"role": "user", "content": user_message})
         continue_after_tools = False
         emergency_tools_used = False
         tools_executed_this_turn = False
+        web_search_executed_this_turn = False
 
         for _ in range(self.max_tool_rounds):
             assistant_text = ""
@@ -704,7 +884,10 @@ class ChatEngine:
                             clean = assistant_text
                     presearch: list[dict[str, Any]] = []
                     event_name = ""
-                    if clean and self._requires_presearch_for_code(user_message) and not tools_executed_this_turn:
+                    if clean and self._requires_workspace_preinspect(user_message) and not tools_executed_this_turn:
+                        presearch = self._preinspect_tool_calls_for_workspace(user_message)
+                        event_name = "workspace_preinspect"
+                    elif clean and self._requires_presearch_for_code(user_message) and not tools_executed_this_turn:
                         presearch = self._presearch_tool_calls_for_code(user_message)
                         event_name = "presearch_for_code"
                     elif clean and self._requires_web_presearch_for_factual(user_message) and not web_search_executed_this_turn:
@@ -737,6 +920,8 @@ class ChatEngine:
                 on_tool_phase()
 
             for call in tool_calls:
+                if on_tool_start:
+                    on_tool_start(call["name"], call.get("args", {}))
                 result = self._execute_tool_call_with_policy(user_message, call)
                 if on_tool:
                     on_tool(call["name"], call.get("args", {}), result)
@@ -763,6 +948,8 @@ class ChatEngine:
     def run_cli(self) -> None:
         print("Local Coding Assistant")
         print("Type 'exit' or 'quit' to stop.")
+        print("Commands: /reset, /maxout <n>, /maxout, /stream <auto|native|chunk>, /stream")
+        print("Autonomous: /auto, /auto on [steps], /auto off")
 
         while True:
             try:
@@ -780,9 +967,88 @@ class ChatEngine:
                 self.history.clear()
                 print("context reset")
                 continue
+            if user_input.startswith("/"):
+                parts = user_input.strip().split()
+                cmd = parts[0].lower()
+                if cmd in {"/maxout", "/maxoutput", "/max_output"}:
+                    if len(parts) == 1:
+                        getter = getattr(self.model, "get_max_output_tokens", None)
+                        current = getter() if callable(getter) else None
+                        if current is None:
+                            print("max output tokens: unavailable for this model")
+                        else:
+                            print(f"max output tokens: {current}")
+                        continue
+                    try:
+                        value = int(parts[1])
+                    except ValueError:
+                        print("usage: /maxout <positive_integer>")
+                        continue
+                    setter = getattr(self.model, "set_max_output_tokens", None)
+                    if not callable(setter):
+                        print("this model does not support changing max output tokens")
+                        continue
+                    ok, msg = setter(value)
+                    print(msg)
+                    continue
+                if cmd == "/stream":
+                    if len(parts) == 1:
+                        getter = getattr(self.model, "get_stream_mode", None)
+                        mode = getter() if callable(getter) else "unknown"
+                        print(f"stream mode: {mode}")
+                        continue
+                    setter = getattr(self.model, "set_stream_mode", None)
+                    if not callable(setter):
+                        print("this model does not support stream mode changes")
+                        continue
+                    ok, msg = setter(parts[1])
+                    print(msg)
+                    continue
+                if cmd in {"/help", "help"}:
+                    print("Commands:")
+                    print("- /reset")
+                    print("- /maxout <n>   set max output tokens")
+                    print("- /maxout       show current max output tokens")
+                    print("- /stream <auto|native|chunk>   set stream mode")
+                    print("- /stream       show current stream mode")
+                    print("- /auto         show autonomous status")
+                    print("- /auto on [steps] / /auto off")
+                    continue
+                if cmd in {"/auto", "/autonomous"}:
+                    if len(parts) == 1:
+                        mode = "on" if self.autonomous_enabled else "off"
+                        print(f"autonomous: {mode} (steps={self.autonomous_steps})")
+                        continue
+                    sub = parts[1].lower()
+                    if sub == "off":
+                        self.autonomous_enabled = False
+                        print("autonomous: off")
+                        continue
+                    if sub == "on":
+                        if len(parts) >= 3:
+                            try:
+                                self.autonomous_steps = max(1, min(int(parts[2]), 30))
+                            except ValueError:
+                                print("usage: /auto on [steps]")
+                                continue
+                        self.autonomous_enabled = True
+                        print(f"autonomous: on (steps={self.autonomous_steps})")
+                        continue
+                    print("usage: /auto | /auto on [steps] | /auto off")
+                    continue
+
+            if self.autonomous_enabled:
+                self.run_autonomous(user_input, self.autonomous_steps)
+                continue
 
             renderer = StreamRenderer()
-            response = self.handle_turn_stream(user_input, renderer.feed, print_tool_event, renderer.prepare_tool_output)
+            response = self.handle_turn_stream(
+                user_input,
+                renderer.feed,
+                print_tool_event,
+                print_tool_start,
+                renderer.prepare_tool_output,
+            )
             renderer.finish()
             if not renderer.has_output:
                 print_formatted_output(response=response)
@@ -790,3 +1056,40 @@ class ChatEngine:
                 answer = extract_answer_text(response)
                 if answer:
                     print_answer_only(answer)
+
+    def run_autonomous(self, objective: str, steps: int) -> None:
+        max_steps = max(1, min(steps, 30))
+        print(f"autonomous run: objective='{objective}' | steps={max_steps}")
+        print("scope: workspace root only")
+
+        for i in range(1, max_steps + 1):
+            if i == 1:
+                prompt = (
+                    "Autonomous mode enabled.\n"
+                    f"Objective: {objective}\n"
+                    "You may plan, research, read/edit files, and improve the project inside workspace root only.\n"
+                    "If finished, include token AUTONOMOUS_DONE in final answer."
+                )
+            else:
+                prompt = (
+                    "Autonomous continue.\n"
+                    f"Objective: {objective}\n"
+                    f"Step: {i}/{max_steps}\n"
+                    "Choose next best action yourself. If finished, include token AUTONOMOUS_DONE."
+                )
+
+            print(f"\n[auto step {i}/{max_steps}]")
+            renderer = StreamRenderer()
+            response = self.handle_turn_stream(
+                prompt,
+                renderer.feed,
+                print_tool_event,
+                print_tool_start,
+                renderer.prepare_tool_output,
+            )
+            renderer.finish()
+            final_text = extract_answer_text(response).strip()
+            if re.search(r"\bAUTONOMOUS_DONE\b", final_text, flags=re.IGNORECASE):
+                print("[auto] done")
+                return
+        print("[auto] step limit reached")
