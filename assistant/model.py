@@ -191,6 +191,48 @@ def _pick_openrouter_model(
     return available[0], f"requested model not found, fallback to {available[0]}"
 
 
+def _http_post_json(
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    timeout: int,
+) -> dict[str, Any]:
+    body = json.dumps(payload).encode("utf-8")
+    req = Request(url, data=body, headers=headers, method="POST")
+    with urlopen(req, timeout=timeout) as resp:  # nosec B310 - provider URL configured by model
+        raw = resp.read().decode("utf-8")
+    return json.loads(raw)
+
+
+def _http_stream_json(
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    timeout: int,
+    *,
+    sse: bool,
+) -> Iterator[dict[str, Any]]:
+    body = json.dumps(payload).encode("utf-8")
+    req = Request(url, data=body, headers=headers, method="POST")
+    with urlopen(req, timeout=timeout) as resp:  # nosec B310 - provider URL configured by model
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="ignore").strip()
+            if not line:
+                continue
+            data_chunk = line
+            if sse:
+                if line.startswith("event:"):
+                    continue
+                if line.startswith("data:"):
+                    data_chunk = line[5:].strip()
+                    if data_chunk == "[DONE]":
+                        break
+            try:
+                yield json.loads(data_chunk)
+            except json.JSONDecodeError:
+                continue
+
+
 class BaseModel:
     provider = "unknown"
     model_name = ""
@@ -405,40 +447,23 @@ class OllamaModel(BaseModel):
         return None
 
     def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        body = json.dumps(payload).encode("utf-8")
-        req = Request(
-            f"{self.base_url}{path}",
-            data=body,
+        return _http_post_json(
+            url=f"{self.base_url}{path}",
+            payload=payload,
             headers={"Content-Type": "application/json"},
-            method="POST",
+            timeout=self.timeout,
         )
-        with urlopen(
-            req, timeout=self.timeout
-        ) as resp:  # nosec B310 - localhost endpoint
-            raw = resp.read().decode("utf-8")
-        return json.loads(raw)
 
     def _stream_post_json(
         self, path: str, payload: dict[str, Any]
     ) -> Iterator[dict[str, Any]]:
-        body = json.dumps(payload).encode("utf-8")
-        req = Request(
-            f"{self.base_url}{path}",
-            data=body,
+        yield from _http_stream_json(
+            url=f"{self.base_url}{path}",
+            payload=payload,
             headers={"Content-Type": "application/json"},
-            method="POST",
+            timeout=self.timeout,
+            sse=False,
         )
-        with urlopen(
-            req, timeout=self.timeout
-        ) as resp:  # nosec B310 - localhost endpoint
-            for raw_line in resp:
-                line = raw_line.decode("utf-8", errors="ignore").strip()
-                if not line:
-                    continue
-                try:
-                    yield json.loads(line)
-                except json.JSONDecodeError:
-                    continue
 
     def _messages_to_prompt(self, messages: list[dict[str, str]]) -> str:
         lines = []
@@ -756,52 +781,26 @@ class OpenRouterModel(BaseModel):
         return headers
 
     def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        body = json.dumps(payload).encode("utf-8")
-        req = Request(
-            f"{self.base_url}{path}",
-            data=body,
+        return _http_post_json(
+            url=f"{self.base_url}{path}",
+            payload=payload,
             headers=self._headers(),
-            method="POST",
+            timeout=self.timeout,
         )
-        with urlopen(
-            req, timeout=self.timeout
-        ) as resp:  # nosec B310 - HTTPS OpenRouter endpoint
-            raw = resp.read().decode("utf-8")
-        return json.loads(raw)
 
     def _stream_post_json(
         self, path: str, payload: dict[str, Any], timeout: int | None = None
     ) -> Iterator[dict[str, Any]]:
-        body = json.dumps(payload).encode("utf-8")
-        req = Request(
-            f"{self.base_url}{path}",
-            data=body,
-            headers=self._headers(),
-            method="POST",
-        )
         effective_timeout = (
             timeout if isinstance(timeout, int) and timeout > 0 else self.timeout
         )
-        with urlopen(
-            req, timeout=effective_timeout
-        ) as resp:  # nosec B310 - HTTPS OpenRouter endpoint
-            for raw_line in resp:
-                line = raw_line.decode("utf-8", errors="ignore").strip()
-                if not line:
-                    continue
-                if line.startswith("event:"):
-                    continue
-                if line.startswith("data:"):
-                    data_chunk = line[5:].strip()
-                    if data_chunk == "[DONE]":
-                        break
-                else:
-                    # Some proxies strip `data:` prefix, keep parser permissive.
-                    data_chunk = line
-                try:
-                    yield json.loads(data_chunk)
-                except json.JSONDecodeError:
-                    continue
+        yield from _http_stream_json(
+            url=f"{self.base_url}{path}",
+            payload=payload,
+            headers=self._headers(),
+            timeout=effective_timeout,
+            sse=True,
+        )
 
     def _chat_payload(
         self, messages: list[dict[str, str]], stream: bool
@@ -1060,47 +1059,26 @@ class GoogleModel(BaseModel):
         }
 
     def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        body = json.dumps(payload).encode("utf-8")
-        req = Request(
-            f"{self.base_url}{path}",
-            data=body,
+        return _http_post_json(
+            url=f"{self.base_url}{path}",
+            payload=payload,
             headers=self._headers(),
-            method="POST",
+            timeout=self.timeout,
         )
-        with urlopen(req, timeout=self.timeout) as resp:  # nosec B310
-            raw = resp.read().decode("utf-8")
-        return json.loads(raw)
 
     def _stream_post_json(
         self, path: str, payload: dict[str, Any], timeout: int | None = None
     ) -> Iterator[dict[str, Any]]:
-        body = json.dumps(payload).encode("utf-8")
-        req = Request(
-            f"{self.base_url}{path}",
-            data=body,
-            headers=self._headers(),
-            method="POST",
-        )
         effective_timeout = (
             timeout if isinstance(timeout, int) and timeout > 0 else self.timeout
         )
-        with urlopen(req, timeout=effective_timeout) as resp:  # nosec B310
-            for raw_line in resp:
-                line = raw_line.decode("utf-8", errors="ignore").strip()
-                if not line:
-                    continue
-                if line.startswith("event:"):
-                    continue
-                if line.startswith("data:"):
-                    data_chunk = line[5:].strip()
-                    if data_chunk == "[DONE]":
-                        break
-                else:
-                    data_chunk = line
-                try:
-                    yield json.loads(data_chunk)
-                except json.JSONDecodeError:
-                    continue
+        yield from _http_stream_json(
+            url=f"{self.base_url}{path}",
+            payload=payload,
+            headers=self._headers(),
+            timeout=effective_timeout,
+            sse=True,
+        )
 
     def _chat_payload(self, messages: list[dict[str, str]]) -> dict[str, Any]:
         # Gemini API strict role alternation requirement.
@@ -1381,48 +1359,28 @@ class NvidiaModel(BaseModel):
         }
 
     def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        body = json.dumps(payload).encode("utf-8")
-        req = Request(
-            f"{self.base_url}{path}",
-            data=body,
+        return _http_post_json(
+            url=f"{self.base_url}{path}",
+            payload=payload,
             headers=self._headers(),
-            method="POST",
+            timeout=self.timeout,
         )
-        with urlopen(req, timeout=self.timeout) as resp:  # nosec B310
-            raw = resp.read().decode("utf-8")
-        return json.loads(raw)
 
     def _stream_post_json(
         self, path: str, payload: dict[str, Any], timeout: int | None = None
     ) -> Iterator[dict[str, Any]]:
-        body = json.dumps(payload).encode("utf-8")
-        req = Request(
-            f"{self.base_url}{path}",
-            data=body,
-            headers=self._headers(),
-            method="POST",
-        )
-        req.add_header("Accept", "text/event-stream")
         effective_timeout = (
             timeout if isinstance(timeout, int) and timeout > 0 else self.timeout
         )
-        with urlopen(req, timeout=effective_timeout) as resp:  # nosec B310
-            for raw_line in resp:
-                line = raw_line.decode("utf-8", errors="ignore").strip()
-                if not line:
-                    continue
-                if line.startswith("event:"):
-                    continue
-                if line.startswith("data:"):
-                    data_chunk = line[5:].strip()
-                    if data_chunk == "[DONE]":
-                        break
-                else:
-                    data_chunk = line
-                try:
-                    yield json.loads(data_chunk)
-                except json.JSONDecodeError:
-                    continue
+        headers = dict(self._headers())
+        headers["Accept"] = "text/event-stream"
+        yield from _http_stream_json(
+            url=f"{self.base_url}{path}",
+            payload=payload,
+            headers=headers,
+            timeout=effective_timeout,
+            sse=True,
+        )
 
     def _chat_payload(
         self, messages: list[dict[str, str]], stream: bool
@@ -1651,6 +1609,69 @@ def list_openrouter_models(
     return sorted(set(names))
 
 
+def _build_openrouter_model(
+    requested_model: str,
+    api_key: str,
+    openrouter_url: str,
+    connect_log: list[str],
+    *,
+    try_label: str,
+    fail_label: str,
+    connected_label: str,
+) -> OpenRouterModel | None:
+    connect_log.append(f"[try] {try_label} @ {openrouter_url}")
+    model_payloads, reachable = _fetch_openrouter_models(
+        api_key=api_key, base_url=openrouter_url, timeout=12
+    )
+    if not reachable:
+        connect_log.append(f"[fail] {fail_label}")
+        return None
+
+    available_models = [
+        str(item.get("id", "")).strip()
+        for item in model_payloads
+        if isinstance(item, dict)
+        and isinstance(item.get("id"), str)
+        and str(item.get("id", "")).strip()
+    ]
+    resolved_model, model_note = _pick_openrouter_model(
+        available=available_models,
+        requested=requested_model,
+        env_fallback=os.getenv(
+            "OPENROUTER_FALLBACK_MODEL", "arcee-ai/trinity-large-preview:free"
+        ),
+    )
+    if resolved_model != requested_model:
+        connect_log.append(f"[warn] requested model '{requested_model}' unavailable")
+        connect_log.append(f"[ok] using '{resolved_model}' ({model_note})")
+    else:
+        connect_log.append(f"[ok] using requested model '{resolved_model}'")
+
+    context_window = None
+    for item in model_payloads:
+        if isinstance(item, dict) and str(item.get("id", "")).strip() == resolved_model:
+            context_window = _extract_openrouter_context_window(item)
+            break
+    if context_window:
+        connect_log.append(f"[ok] model context window={context_window}")
+
+    openrouter = OpenRouterModel(
+        model_name=resolved_model,
+        api_key=api_key,
+        base_url=openrouter_url,
+        context_window=context_window,
+    )
+    connect_log.append(f"[ok] {connected_label}, model={resolved_model}")
+    connect_log.append(
+        f"[ok] online limits maxout={openrouter.get_max_output_tokens()} "
+        f"(context={openrouter.get_context_window() or 'unknown'})"
+    )
+    if openrouter.provider_order:
+        mode = "only" if openrouter.provider_only else "order"
+        connect_log.append(f"[ok] provider routing: {mode}={openrouter.provider_order}")
+    return openrouter
+
+
 def build_model(
     model_name: str,
     provider: str = "auto",
@@ -1717,61 +1738,19 @@ def build_model(
             fb = FallbackModel(reason="OPENROUTER_API_KEY missing")
             fb.connect_log = connect_log
             return fb
-        connect_log.append(f"[try] openrouter @ {openrouter_url}")
-        model_payloads, reachable = _fetch_openrouter_models(
-            api_key=api_key, base_url=openrouter_url, timeout=12
+        openrouter = _build_openrouter_model(
+            requested_model=model_name,
+            api_key=api_key,
+            openrouter_url=openrouter_url,
+            connect_log=connect_log,
+            try_label="openrouter",
+            fail_label="openrouter unavailable or unauthorized",
+            connected_label="openrouter connected",
         )
-        if not reachable:
-            connect_log.append("[fail] openrouter unavailable or unauthorized")
+        if openrouter is None:
             fb = FallbackModel(reason="OpenRouter unavailable or unauthorized")
             fb.connect_log = connect_log
             return fb
-        available_models = [
-            str(item.get("id", "")).strip()
-            for item in model_payloads
-            if isinstance(item, dict)
-            and isinstance(item.get("id"), str)
-            and str(item.get("id", "")).strip()
-        ]
-        resolved_model, model_note = _pick_openrouter_model(
-            available=available_models,
-            requested=model_name,
-            env_fallback=os.getenv(
-                "OPENROUTER_FALLBACK_MODEL", "arcee-ai/trinity-large-preview:free"
-            ),
-        )
-        if resolved_model != model_name:
-            connect_log.append(f"[warn] requested model '{model_name}' unavailable")
-            connect_log.append(f"[ok] using '{resolved_model}' ({model_note})")
-        else:
-            connect_log.append(f"[ok] using requested model '{resolved_model}'")
-        context_window = None
-        for item in model_payloads:
-            if (
-                isinstance(item, dict)
-                and str(item.get("id", "")).strip() == resolved_model
-            ):
-                context_window = _extract_openrouter_context_window(item)
-                break
-        if context_window:
-            connect_log.append(f"[ok] model context window={context_window}")
-        openrouter = OpenRouterModel(
-            model_name=resolved_model,
-            api_key=api_key,
-            base_url=openrouter_url,
-            context_window=context_window,
-        )
-        # reachable already confirmed above; skip redundant is_available() call
-        connect_log.append(f"[ok] openrouter connected, model={resolved_model}")
-        connect_log.append(
-            f"[ok] online limits maxout={openrouter.get_max_output_tokens()} "
-            f"(context={openrouter.get_context_window() or 'unknown'})"
-        )
-        if openrouter.provider_order:
-            mode = "only" if openrouter.provider_only else "order"
-            connect_log.append(
-                f"[ok] provider routing: {mode}={openrouter.provider_order}"
-            )
         openrouter.connect_log = connect_log
         return openrouter
 
@@ -1788,59 +1767,16 @@ def build_model(
         return ollama
     connect_log.append("[fail] auto ollama unavailable")
     if api_key:
-        connect_log.append(f"[try] auto->openrouter @ {openrouter_url}")
-        model_payloads, reachable = _fetch_openrouter_models(
-            api_key=api_key, base_url=openrouter_url, timeout=12
+        openrouter = _build_openrouter_model(
+            requested_model=model_name,
+            api_key=api_key,
+            openrouter_url=openrouter_url,
+            connect_log=connect_log,
+            try_label="auto->openrouter",
+            fail_label="auto openrouter unavailable or unauthorized",
+            connected_label="auto selected openrouter",
         )
-        if not reachable:
-            connect_log.append("[fail] auto openrouter unavailable or unauthorized")
-        else:
-            available_models = [
-                str(item.get("id", "")).strip()
-                for item in model_payloads
-                if isinstance(item, dict)
-                and isinstance(item.get("id"), str)
-                and str(item.get("id", "")).strip()
-            ]
-            resolved_model, model_note = _pick_openrouter_model(
-                available=available_models,
-                requested=model_name,
-                env_fallback=os.getenv(
-                    "OPENROUTER_FALLBACK_MODEL", "arcee-ai/trinity-large-preview:free"
-                ),
-            )
-            if resolved_model != model_name:
-                connect_log.append(f"[warn] requested model '{model_name}' unavailable")
-                connect_log.append(f"[ok] using '{resolved_model}' ({model_note})")
-            else:
-                connect_log.append(f"[ok] using requested model '{resolved_model}'")
-            context_window = None
-            for item in model_payloads:
-                if (
-                    isinstance(item, dict)
-                    and str(item.get("id", "")).strip() == resolved_model
-                ):
-                    context_window = _extract_openrouter_context_window(item)
-                    break
-            if context_window:
-                connect_log.append(f"[ok] model context window={context_window}")
-            openrouter = OpenRouterModel(
-                model_name=resolved_model,
-                api_key=api_key,
-                base_url=openrouter_url,
-                context_window=context_window,
-            )
-            # reachable already confirmed above; skip redundant is_available() call
-            connect_log.append(f"[ok] auto selected openrouter, model={resolved_model}")
-            connect_log.append(
-                f"[ok] online limits maxout={openrouter.get_max_output_tokens()} "
-                f"(context={openrouter.get_context_window() or 'unknown'})"
-            )
-            if openrouter.provider_order:
-                mode = "only" if openrouter.provider_only else "order"
-                connect_log.append(
-                    f"[ok] provider routing: {mode}={openrouter.provider_order}"
-                )
+        if openrouter is not None:
             openrouter.connect_log = connect_log
             return openrouter
     else:
