@@ -140,6 +140,24 @@ class TestMemoryStore(unittest.TestCase):
         self.assertEqual(matches[0]["strategy"][1]["depends_on"], [1])
         self.assertEqual(matches[0]["context"].get("framework"), "pytest")
 
+    def test_find_strategies_success_rate_is_per_item(self):
+        self.store.record_strategy(
+            goal="stable flow",
+            strategy=[{"step_id": 1, "action": "run_tests", "args": {}, "depends_on": []}],
+            success=True,
+        )
+        self.store.record_strategy(
+            goal="risky flow",
+            strategy=[{"step_id": 1, "action": "execute_command", "args": {"cmd": "npm test"}, "depends_on": []}],
+            success=False,
+        )
+        matches = self.store.find_strategies("flow", limit=5)
+        rates = {str(item.get("goal", "")): float(item.get("success_rate", -1.0)) for item in matches}
+        self.assertIn("stable flow", rates)
+        self.assertIn("risky flow", rates)
+        self.assertEqual(rates["stable flow"], 1.0)
+        self.assertEqual(rates["risky flow"], 0.0)
+
     def test_find_root_cause_interpolates_fix_template(self):
         root_file = self.store.root_causes_dir / "import_errors.json"
         root_file.write_text(
@@ -184,6 +202,58 @@ class TestMemoryStore(unittest.TestCase):
         self.assertTrue(result["ok"])
         matches = self.store.find_root_causes("AssertionError: bad", context={}, limit=1)
         self.assertEqual(matches[0]["success_count"], 1)
+
+    def test_upsert_root_cause_creates_and_merges_entries(self):
+        created = self.store.upsert_root_cause(
+            pattern="ModuleNotFoundError: ${module}",
+            context={"language": "python"},
+            fix_template=[{"tool": "execute_command", "args": {"cmd": "pip install ${module}"}}],
+            success=True,
+            confidence=0.8,
+            source="test",
+        )
+        self.assertTrue(created["ok"])
+        self.assertTrue(created["created"])
+        self.assertEqual(created["bucket"], "import_errors.json")
+
+        merged = self.store.upsert_root_cause(
+            pattern="ModuleNotFoundError: ${module}",
+            context={"language": "python"},
+            fix_template=[{"tool": "execute_command", "args": {"cmd": "pip install ${module}"}}],
+            success=False,
+            confidence=0.2,
+            source="test",
+        )
+        self.assertTrue(merged["ok"])
+        self.assertFalse(merged["created"])
+        self.assertEqual(int(merged["entry"]["success_count"]), 1)
+        self.assertEqual(int(merged["entry"]["fail_count"]), 1)
+
+        import_path = self.store.root_causes_dir / "import_errors.json"
+        payload = import_path.read_text(encoding="utf-8")
+        self.assertEqual(payload.count("ModuleNotFoundError: ${module}"), 1)
+
+    def test_upsert_root_cause_bucket_classifier(self):
+        self.store.upsert_root_cause(
+            pattern="missing dependency for package",
+            context={"language": "python"},
+            fix_template=[{"tool": "execute_command", "args": {"cmd": "pip install requests"}}],
+            success=True,
+            confidence=0.7,
+            source="test",
+        )
+        self.store.upsert_root_cause(
+            pattern="AssertionError",
+            context={"framework": "pytest"},
+            fix_template=[{"tool": "run_tests", "args": {"path": ".", "runner": "pytest"}}],
+            success=True,
+            confidence=0.7,
+            source="test",
+        )
+        imports = (self.store.root_causes_dir / "import_errors.json").read_text(encoding="utf-8")
+        tests = (self.store.root_causes_dir / "test_failures.json").read_text(encoding="utf-8")
+        self.assertIn("missing dependency for package", imports)
+        self.assertIn("AssertionError", tests)
 
 
 if __name__ == "__main__":

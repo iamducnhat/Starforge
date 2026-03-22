@@ -1,4 +1,4 @@
-# Local RAG Assistant
+# Starforge (RAG Assistant)
 
 A local coding assistant for tool-driven development workflows, with:
 
@@ -6,28 +6,61 @@ A local coding assistant for tool-driven development workflows, with:
 - OpenAI-compatible API server mode
 - Workspace-safe file tools
 - Hybrid memory (keyword + semantic retrieval)
-- Planner-based autonomous loop with reflection
+- Deterministic DAG planning with topological step scheduling (`id/type/tool/args/depends_on/expected`)
+- Autonomous loop with structured execution validation (`execute -> validate -> score -> decide`)
+- Project-awareness bootstrap (`detect_project_context`) for autonomous runs
+- Automatic skill learning from validated successful tool sequences
+- Parameterized skill templates with reusable inputs and step placeholders
+- Strategy memory for successful multi-step plans
+- Root-cause memory with deterministic repair template execution
+- Hypothesis-driven repair loop with duplicate-hypothesis and duplicate-fix prevention
+- Hybrid strategy planner that reuses strategy skeletons and fills missing steps
+- Reflection and reliability layers for tool retries and replanning
+- Lightweight cost-awareness via token budgeting and per-run metrics
+- Real-time trajectory logging for delayed offline fine-tuning
 - Optional fine-tuning utilities
 
 ## Table of Contents
 
-1. [What This Project Does](#what-this-project-does)
-2. [Architecture Overview](#architecture-overview)
-3. [Project Structure](#project-structure)
-4. [Requirements](#requirements)
-5. [Install](#install)
-6. [Quick Start](#quick-start)
-7. [CLI Commands](#cli-commands)
-8. [Model Providers](#model-providers)
-9. [Configuration](#configuration)
-10. [Tools](#tools)
-11. [Memory System](#memory-system)
-12. [Autonomous Mode](#autonomous-mode)
-13. [Server Mode (OpenAI-Compatible)](#server-mode-openai-compatible)
-14. [Testing](#testing)
-15. [Fine-Tuning](#fine-tuning)
-16. [Troubleshooting](#troubleshooting)
-17. [Notes and Constraints](#notes-and-constraints)
+- [Starforge (RAG Assistant)](#starforge-rag-assistant)
+  - [Table of Contents](#table-of-contents)
+  - [What This Project Does](#what-this-project-does)
+  - [Architecture Overview](#architecture-overview)
+  - [Project Structure](#project-structure)
+  - [Requirements](#requirements)
+  - [Install](#install)
+  - [Quick Start](#quick-start)
+    - [1) Configure environment](#1-configure-environment)
+    - [2) Run CLI](#2-run-cli)
+    - [3) One-shot prompt](#3-one-shot-prompt)
+    - [4) Start API server](#4-start-api-server)
+  - [CLI Commands](#cli-commands)
+  - [Model Providers](#model-providers)
+    - [OpenRouter](#openrouter)
+    - [Ollama](#ollama)
+    - [Google](#google)
+    - [Nvidia](#nvidia)
+  - [Configuration](#configuration)
+    - [Common runtime env vars](#common-runtime-env-vars)
+    - [Provider-specific env vars](#provider-specific-env-vars)
+  - [Tools](#tools)
+    - [Tool reliability layer](#tool-reliability-layer)
+  - [Memory System](#memory-system)
+  - [Autonomous Mode](#autonomous-mode)
+  - [Server Mode (OpenAI-Compatible)](#server-mode-openai-compatible)
+    - [Example: health check](#example-health-check)
+    - [Example: non-streaming completion](#example-non-streaming-completion)
+    - [Example: streaming completion](#example-streaming-completion)
+  - [Testing](#testing)
+  - [Fine-Tuning](#fine-tuning)
+    - [Build datasets](#build-datasets)
+    - [Train LoRA SFT](#train-lora-sft)
+  - [Troubleshooting](#troubleshooting)
+    - [OpenRouter key missing](#openrouter-key-missing)
+    - [402 payment required from provider](#402-payment-required-from-provider)
+    - [Context or output too large/small](#context-or-output-too-largesmall)
+    - [Repeated autonomous loops](#repeated-autonomous-loops)
+  - [Notes and Constraints](#notes-and-constraints)
 
 ## What This Project Does
 
@@ -49,10 +82,11 @@ At a high level:
 
 1. `main.py` builds the model + tool system + chat engine.
 2. `assistant/chat_engine.py` manages conversation flow, tool-call loops, autonomous runs, session persistence, and reflection.
-3. `assistant/tools.py` dispatches tools and wraps calls with reliability retries/fallbacks.
+3. `assistant/tools.py` dispatches tools, normalizes legacy tool names/args, and wraps calls with reliability retries/fallbacks.
 4. `assistant/workspace_tools.py` handles file/project/plan/symbol operations with workspace path guards.
-5. `assistant/memory.py` manages memory blocks and hybrid retrieval.
+5. `assistant/memory.py` manages memory blocks, strategy memory, root-cause memory, and hybrid retrieval with recency/success ranking.
 6. `assistant/server.py` exposes an OpenAI-compatible `/v1/chat/completions` API.
+7. Autonomous runs use dependency-aware task queues, structured validator signals, reusable strategy recall, and token-budgeted runtime metrics.
 
 ## Project Structure
 
@@ -62,13 +96,15 @@ assistant/
   model.py                 # provider adapters and model routing
   tools.py                 # tool dispatcher + reliability wrapper
   workspace_tools.py       # file/project/plan/symbol tools
-  memory.py                # memory blocks + semantic retrieval
+  memory.py                # memory blocks + strategy memory + semantic retrieval
   server.py                # OpenAI-compatible API
   prompt.py                # system prompt and tool protocol
 
-functions/                 # persisted reusable functions/tool-macros
+functions/                 # persisted reusable functions/tool-macros/skills
 memory/
   blocks/                  # memory blocks
+  strategies/              # successful multi-step strategy snapshots
+  root_causes/             # learned deterministic repair patterns/templates
   plans/                   # plan JSON files
   sessions/                # session logs
 
@@ -213,6 +249,12 @@ python3 main.py --list-models
 - `ASSISTANT_PLAN_STEP_CAP` (default `8`)
 - `ASSISTANT_TOOL_RETRIES` (default `2`)
 - `ASSISTANT_TOOL_RETRY_BACKOFF` (default `0.35`)
+- `ASSISTANT_EXEC_VALIDATION_THRESHOLD` (default `0.55`)
+- `ASSISTANT_AUTO_LEARN_SKILLS` (default on)
+- `ASSISTANT_AUTO_VALIDATE_CHANGES` (default on)
+- `ASSISTANT_AUTO_TEST_REPAIR_ATTEMPTS` (default `3`)
+- `ASSISTANT_AUTO_TOKEN_BUDGET` (`0` disables budget enforcement)
+- `ASSISTANT_LOG_INTERACTIONS` (default on)
 - `ASSISTANT_LOG_FILE` (server mode sets `log.txt` if unset)
 
 ### Provider-specific env vars
@@ -249,8 +291,14 @@ Memory/tools:
 
 - `find_in_memory`
 - `search_memory`
+- `find_strategies`
+- `record_strategy`
 - `create_block`
 - `create_function`
+- `create_skill`
+- `list_skills`
+- `find_skills`
+- `record_skill_outcome`
 - `run_function`
 
 Web/tools:
@@ -294,12 +342,28 @@ Terminal tool:
 - retry for transient failures (timeouts/rate limits/network)
 - fallback argument strategy for fragile web tools
 - attempt metadata in tool results
+- canonical alias resolution for common model drift (`google_search`, `web_search`, `search_manga`, etc.)
+- argument-shape normalization for common malformed payloads (`queries` -> `query`, `limit` -> `max_results`)
+
+Skills can now be stored as parameterized templates, for example:
+
+```json
+{
+  "skill": "fix_import_error",
+  "inputs": ["file_path", "search_query"],
+  "steps_template": [
+    {"tool": "search_project", "args": {"query": "${search_query}"}},
+    {"tool": "edit_file", "args": {"path": "${file_path}"}}
+  ],
+  "match_conditions": ["import error", "module not found"]
+}
+```
 
 ## Memory System
 
-Memory blocks are filesystem-backed in `memory/blocks`.
+Memory is filesystem-backed in `memory/blocks`, `memory/strategies`, and `memory/root_causes`.
 
-Each block stores metadata (`info.json`) + content (`knowledge.md`).
+Blocks store metadata (`info.json`) + content (`knowledge.md`).
 
 Retrieval:
 
@@ -307,6 +371,19 @@ Retrieval:
   - keyword overlap
   - semantic similarity (local hashed embedding vectors)
 - `search_memory(query)` performs semantic search directly
+- ranking includes recency and historical success weighting (`record_memory_feedback`)
+- `record_strategy(goal, strategy, success)` stores normalized multi-step plans with success/failure counters
+- `find_strategies(query)` retrieves prior successful plans for planning reuse before asking the model to synthesize a new plan
+- root-cause memory stores deterministic repair templates in:
+  - `memory/root_causes/import_errors.json`
+  - `memory/root_causes/test_failures.json`
+- root-cause APIs in `MemoryStore` include:
+  - `find_root_causes(error_text, context)` for deterministic root-cause matching
+  - `record_root_cause_feedback(root_cause_id, success, confidence)` for confidence/count updates
+  - `upsert_root_cause(pattern, context, fix_template, success, confidence, source, bucket_hint?)` for create/merge learning
+- `memory/interaction_trajectories.jsonl` stores compact run trajectories with prompt, plan, tool trace, result, success flag, score, retry count, and error count
+
+This project does not do live weight updates on each user message. Immediate adaptation happens through memory retrieval, strategy reuse, and parameterized skills. Weight updates are intended to happen offline from filtered trajectory logs.
 
 ## Autonomous Mode
 
@@ -320,12 +397,45 @@ python3 main.py --autonomous --autonomous-steps 0
 
 Autonomous flow now includes:
 
-1. planner step: model generates executable plan steps
-2. `TaskState` tracks `goal`, `steps`, `current_step`, `history`
-3. loop executes current step
-4. reflection decides `advance`, `retry`, `replan`, `done`, or `bored`
+1. deterministic planning: planner output is normalized into structured steps and topologically sorted into a strict dependency-aware execution queue
+2. hybrid strategy planner: reusable strategy skeletons are ranked by goal/context/success, then missing capability steps are generated and merged (`inspect/modify/validate`)
+3. project-awareness bootstrap: run `detect_project_context` once and inject framework/test context into each step prompt
+4. execution: run current step with tools and reflection
+5. execution validator: score each step with structured evidence checks (tool success, test pass/fail, exit codes, diff presence, expected-output coverage, failure markers)
+6. workspace grounding: `run_tests` parses structured failure summaries, failed node IDs, and test counts
+7. optional workspace validation: run `validate_workspace_changes` after edit-like steps
+8. root-cause deterministic fast path: before model repair, check root-cause memory and apply template fixes when top match score is high (`>= 0.75`)
+9. hypothesis-driven test repair loop: run `hypothesis -> fix -> test`, skip duplicate hypotheses, and skip repeated non-improving fix signatures
+10. success-gated root-cause learning: when repair resolves failures, persist the failure pattern + successful fix sequence via `upsert_root_cause(...)`
+11. decision gate: `advance/retry/replan/done/bored` is influenced by reflection and validator threshold
+12. behavior learning: successful validated step tool sequences can be auto-saved as reusable parameterized skills
+13. strategy reuse: successful autonomous runs can be recalled as reusable multi-step plans for future objectives
+14. lightweight performance tracking: per-run metrics include success rate, retry count, replan count, test-repair attempts, tool failure rate, validator failures, and estimated output token usage
+15. optional cost guard: `ASSISTANT_AUTO_TOKEN_BUDGET` can stop long autonomous runs once the estimated output budget is reached
+16. interaction logging: chat turns and autonomous steps emit compact trajectories that can later be filtered into offline LoRA datasets
 
 Per-tool reflection can also trigger retries with revised calls.
+
+Planner schema accepted by the runtime:
+
+```json
+{
+  "steps": [
+    {
+      "id": 1,
+      "type": "tool_call",
+      "tool": "search_project",
+      "args": {"query": "login"},
+      "depends_on": [],
+      "expected": "list of matching files"
+    }
+  ]
+}
+```
+
+Compatibility aliases are accepted: `step_id <-> id`, `action <-> tool`, `expected_output <-> expected`.
+
+Step dependencies are enforced by the runtime. If the planner emits out-of-order but valid dependency references, the runtime reorders the plan via topological sort before execution. Cycles are broken deterministically as a fallback instead of allowing unsafe parallel or skipped execution.
 
 ## Server Mode (OpenAI-Compatible)
 
@@ -383,9 +493,11 @@ Run core tests:
 ```bash
 PYTHONPATH=$PWD python3 -m pytest -q \
   tests/test_memory.py \
+  tests/test_structured_planner.py \
   tests/test_tool_calls.py \
   tests/test_utils.py \
   tests/test_code_intelligence.py \
+  tests/test_skills.py \
   tests/test_tool_reliability.py
 ```
 
@@ -401,11 +513,17 @@ PYTHONPATH=$PWD python3 -m pytest -q tests
 
 ```bash
 python3 finetune/build_function_dataset.py
+python3 finetune/build_interaction_dataset.py \
+  --input memory/interaction_trajectories.jsonl \
+  --output finetune/interaction_train.jsonl \
+  --min-score 0.7 --max-retries 0 --max-errors 0
 python3 finetune/generate_synthetic_tool_use.py --per-topic 120
 python3 finetune/build_full_tool_dataset.py \
   --train-output finetune/train_tool_use_full.jsonl \
   --val-output finetune/val_tool_use_full.jsonl
 ```
+
+`build_full_tool_dataset.py` now automatically folds in high-quality interaction trajectories from `memory/interaction_trajectories.jsonl`, filtered to successful low-retry low-error runs.
 
 ### Train LoRA SFT
 
@@ -468,4 +586,3 @@ Use:
 - Workspace path guard prevents file operations outside project root.
 - System prompt asks the agent to place generated task artifacts in `workspaces/<task_name>/`.
 - For time-sensitive factual queries, the assistant is configured to call date/time + web tools first.
-

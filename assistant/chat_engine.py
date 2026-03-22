@@ -1008,6 +1008,121 @@ class ChatEngine:
             return 0.15
         return matched / total
 
+    @staticmethod
+    def _is_code_like_objective(objective: str) -> bool:
+        text = str(objective or "").lower()
+        markers = (
+            "fix",
+            "test",
+            "bug",
+            "refactor",
+            "implement",
+            "code",
+            "patch",
+            "compile",
+            "build",
+            "pytest",
+            "npm",
+        )
+        return any(marker in text for marker in markers)
+
+    @classmethod
+    def _required_strategy_capabilities(cls, objective: str) -> set[str]:
+        if not cls._is_code_like_objective(objective):
+            return set()
+        return {"inspect", "modify", "validate"}
+
+    @staticmethod
+    def _step_capability(step: PlanStep) -> str | None:
+        action = str(step.action or "").strip().lower()
+        if not action:
+            return None
+        if any(k in action for k in ("search", "read", "inspect", "lookup", "list")):
+            return "inspect"
+        if any(k in action for k in ("edit", "write", "create", "implement", "fix", "patch", "refactor")):
+            return "modify"
+        if any(k in action for k in ("test", "validate", "verify", "check", "diff")):
+            return "validate"
+        return None
+
+    @classmethod
+    def _plan_capabilities(cls, steps: list[PlanStep]) -> set[str]:
+        caps: set[str] = set()
+        for step in steps:
+            cap = cls._step_capability(step)
+            if cap:
+                caps.add(cap)
+        return caps
+
+    def _fill_strategy_gaps(
+        self,
+        objective: str,
+        skeleton_steps: list[PlanStep],
+        step_cap: int,
+    ) -> list[PlanStep]:
+        required = self._required_strategy_capabilities(objective)
+        if not required:
+            return skeleton_steps
+        missing = sorted(required - self._plan_capabilities(skeleton_steps))
+        if not missing:
+            return skeleton_steps
+        remaining = max(0, int(step_cap) - len(skeleton_steps))
+        if remaining <= 0:
+            return skeleton_steps
+
+        serialized = [
+            {
+                "step_id": step.step_id,
+                "action": step.action,
+                "args": step.args,
+                "depends_on": step.depends_on,
+                "expected_output": step.expected_output,
+            }
+            for step in skeleton_steps
+        ]
+        prompt = (
+            "You are augmenting an existing execution plan with only missing capability steps.\n"
+            "Return strict JSON only in shape: {\"steps\":[{...}]}\n"
+            f"Objective: {objective}\n"
+            f"Current reusable strategy steps: {json.dumps(serialized, ensure_ascii=False)}\n"
+            f"Missing capabilities to add: {missing}\n"
+            "Rules:\n"
+            f"- Add at most {remaining} new steps.\n"
+            "- Keep existing step ids untouched.\n"
+            "- New depends_on may reference existing step ids and other new step ids.\n"
+            "- Do not duplicate existing steps.\n"
+            "- Use compatibility aliases id/tool/expected if needed.\n"
+        )
+        try:
+            raw = self.model.generate(
+                [
+                    {
+                        "role": "system",
+                        "content": "You are a planner that returns JSON only.",
+                    },
+                    {"role": "user", "content": prompt},
+                ]
+            )
+            payload = parse_json_payload(self._strip_thinking(raw))
+            generated: list[PlanStep] = []
+            if isinstance(payload, dict) and isinstance(payload.get("steps"), list):
+                generated = self._coerce_structured_plan(
+                    payload, fallback_goal=objective
+                )
+            elif isinstance(payload, list):
+                generated = self._coerce_structured_plan(
+                    payload, fallback_goal=objective
+                )
+        except Exception:
+            generated = []
+        if not generated:
+            return skeleton_steps
+        merged = self._validate_plan_steps(
+            list(skeleton_steps) + generated,
+            fallback_goal=objective,
+        )
+        return merged[: max(1, step_cap)]
+
     def _plan_objective_steps(
         self, objective: str, step_cap: int | None = None
     ) -> list[PlanStep]:
@@ -1022,7 +1137,11 @@ class ChatEngine:
             objective, step_cap=cap, runtime_context=runtime_context
         )
         if reused:
-            return reused[:cap]
+            return self._fill_strategy_gaps(
+                objective=objective,
+                skeleton_steps=reused[:cap],
+                step_cap=cap,
+            )[:cap]
         planning_prompt = (
             "Break this objective into actionable execution steps with strict structure.\n"
             f"Objective: {objective}\n"
@@ -1108,7 +1227,7 @@ class ChatEngine:
             ranked.append((hybrid_score, match))
         ranked.sort(key=lambda item: item[0], reverse=True)
         top_score, top = ranked[0]
-        if top_score < 0.7:
+        if top_score < 0.55:
             return []
         steps = self._validate_plan_steps(
             self._coerce_structured_plan(top.get("strategy", []), fallback_goal=objective),
@@ -3786,34 +3905,56 @@ class ChatEngine:
         return context
 
     @staticmethod
-    def _extract_root_cause_error_text(workspace_validation: dict[str, Any] | None) -> str:
+    def _extract_root_cause_error_text(
+        workspace_validation: dict[str, Any] | None,
+        tool_payloads: list[dict[str, Any]] | None = None,
+    ) -> str:
         if not isinstance(workspace_validation, dict):
-            return ""
-        lines: list[str] = []
-        signals = workspace_validation.get("validation_signals", {})
-        if isinstance(signals, dict):
-            failures = signals.get("test_failures", [])
-            if isinstance(failures, list):
-                for item in failures[:6]:
-                    if not isinstance(item, dict):
-                        continue
-                    summary = str(item.get("summary", "")).strip()
-                    message = str(item.get("message", "")).strip()
-                    nodeid = str(item.get("nodeid", "")).strip()
-                    if summary:
-                        lines.append(summary)
-                    elif nodeid and message:
-                        lines.append(f"{nodeid}: {message}")
-                    elif message:
-                        lines.append(message)
-        tests = workspace_validation.get("tests", {})
-        if isinstance(tests, dict):
-            stderr = str(tests.get("stderr", "")).strip()
-            stdout = str(tests.get("stdout", "")).strip()
+            lines: list[str] = []
+        else:
+            lines = []
+            signals = workspace_validation.get("validation_signals", {})
+            if isinstance(signals, dict):
+                failures = signals.get("test_failures", [])
+                if isinstance(failures, list):
+                    for item in failures[:6]:
+                        if not isinstance(item, dict):
+                            continue
+                        summary = str(item.get("summary", "")).strip()
+                        message = str(item.get("message", "")).strip()
+                        nodeid = str(item.get("nodeid", "")).strip()
+                        if summary:
+                            lines.append(summary)
+                        elif nodeid and message:
+                            lines.append(f"{nodeid}: {message}")
+                        elif message:
+                            lines.append(message)
+            tests = workspace_validation.get("tests", {})
+            if isinstance(tests, dict):
+                stderr = str(tests.get("stderr", "")).strip()
+                stdout = str(tests.get("stdout", "")).strip()
+                if stderr:
+                    lines.append(stderr[:900])
+                elif stdout:
+                    lines.append(stdout[:600])
+        for payload in tool_payloads or []:
+            if not isinstance(payload, dict):
+                continue
+            result = payload.get("result", {})
+            if not isinstance(result, dict) or result.get("ok", False):
+                continue
+            tool = str(payload.get("tool", "")).strip() or str(
+                payload.get("name", "")
+            ).strip()
+            error = str(result.get("error", "")).strip()
+            stderr = str(result.get("stderr", "")).strip()
+            stdout = str(result.get("stdout", "")).strip()
+            if error:
+                lines.append(f"{tool}: {error}")
             if stderr:
-                lines.append(stderr[:900])
+                lines.append(stderr[:500])
             elif stdout:
-                lines.append(stdout[:600])
+                lines.append(stdout[:300])
         return "\n".join(line for line in lines if line).strip()[:1800]
 
     @staticmethod
@@ -3834,13 +3975,17 @@ class ChatEngine:
         self,
         step: PlanStep,
         workspace_validation: dict[str, Any] | None,
+        current_tool_payloads: list[dict[str, Any]],
         project_context: dict[str, Any],
         auto_metrics: dict[str, Any],
     ) -> tuple[bool, list[dict[str, Any]], dict[str, Any] | None, dict[str, Any] | None]:
         store = self._strategy_memory_store()
         if store is None or not hasattr(store, "find_root_causes"):
             return False, [], workspace_validation, None
-        error_text = self._extract_root_cause_error_text(workspace_validation)
+        error_text = self._extract_root_cause_error_text(
+            workspace_validation,
+            tool_payloads=current_tool_payloads,
+        )
         if not error_text:
             return False, [], workspace_validation, None
         context = self._build_root_cause_context(step=step, project_context=project_context)
@@ -3851,6 +3996,22 @@ class ChatEngine:
         if not isinstance(matches, list) or not matches:
             return False, [], workspace_validation, None
         selected = matches[0]
+        match_score = float(selected.get("score", 0.0) or 0.0)
+        if match_score < 0.75:
+            history_item = {
+                "attempt": 0,
+                "kind": "root_cause",
+                "pattern": str(selected.get("pattern", "")).strip(),
+                "root_cause_id": str(selected.get("id", "")).strip(),
+                "hypothesis": f"root-cause match: {str(selected.get('pattern', '')).strip()}",
+                "confidence": float(selected.get("confidence", 0.5) or 0.5),
+                "result": "failed",
+                "impact": "no_change",
+                "outcome": "unchanged",
+                "fix_signature": "",
+                "skipped": "low_match_score",
+            }
+            return False, [], workspace_validation, history_item
         fix_template = selected.get("fix_template", [])
         if not isinstance(fix_template, list) or not fix_template:
             return False, [], workspace_validation, None
@@ -3903,8 +4064,66 @@ class ChatEngine:
             "result": "success" if solved else "failed",
             "impact": "resolved" if solved else "no_change",
             "outcome": "resolved" if solved else "unchanged",
+            "fix_signature": self._repair_fix_signature(root_payloads),
         }
         return solved, root_payloads, updated_validation, history_item
+
+    @staticmethod
+    def _derive_root_cause_pattern_from_snapshot(snapshot: dict[str, Any]) -> str:
+        summary = str(snapshot.get("summary", "")).strip()
+        if not summary:
+            return ""
+        m = re.search(r"ModuleNotFoundError:\s*([A-Za-z0-9_.\-]+)", summary)
+        if m:
+            return "ModuleNotFoundError: ${module}"
+        m = re.search(r"No module named ['\"]?([A-Za-z0-9_.\-]+)", summary, re.IGNORECASE)
+        if m:
+            return "No module named ${module}"
+        if "AssertionError" in summary:
+            return "AssertionError"
+        first = summary.splitlines()[0].strip()
+        return first[:180]
+
+    def _maybe_record_learned_root_cause(
+        self,
+        step: PlanStep,
+        project_context: dict[str, Any],
+        before_snapshot: dict[str, Any],
+        repair_payloads: list[dict[str, Any]],
+        confidence: float,
+    ) -> None:
+        store = self._strategy_memory_store()
+        if store is None or not hasattr(store, "upsert_root_cause"):
+            return
+        pattern = self._derive_root_cause_pattern_from_snapshot(before_snapshot)
+        if not pattern:
+            return
+        successful_tools: list[dict[str, Any]] = []
+        for payload in repair_payloads:
+            if not isinstance(payload, dict):
+                continue
+            result = payload.get("result", {})
+            if not isinstance(result, dict) or not result.get("ok", False):
+                continue
+            tool = str(payload.get("tool", "")).strip()
+            args = payload.get("args", {})
+            if not tool or not isinstance(args, dict):
+                continue
+            successful_tools.append({"tool": tool, "args": args})
+        if not successful_tools:
+            return
+        context = self._build_root_cause_context(step=step, project_context=project_context)
+        try:
+            store.upsert_root_cause(
+                pattern=pattern,
+                context=context,
+                fix_template=successful_tools,
+                success=True,
+                confidence=max(0.0, min(float(confidence), 1.0)),
+                source="autonomous_repair",
+            )
+        except Exception:
+            pass
 
     def _propose_test_failure_hypothesis(
         self,
@@ -4063,11 +4282,13 @@ class ChatEngine:
         latest_text: str | None = None
         repair_history: list[dict[str, Any]] = []
         repair_state = RepairState()
+        improving_fix_signatures: set[str] = set()
 
         # Root-cause first-pass: deterministic fix templates before model-driven repair.
         solved_by_root_cause, root_payloads, validation, root_history = self._maybe_apply_root_cause_fix(
             step=step,
             workspace_validation=validation,
+            current_tool_payloads=combined_payloads,
             project_context=project_context,
             auto_metrics=auto_metrics,
         )
@@ -4107,6 +4328,7 @@ class ChatEngine:
                         + int(before_snapshot.get("test_errors", 0) or 0),
                         "after_total": int(before_snapshot.get("failed_tests", 0) or 0)
                         + int(before_snapshot.get("test_errors", 0) or 0),
+                        "fix_signature": "",
                         "skipped": "duplicate_hypothesis",
                     }
                 )
@@ -4148,7 +4370,26 @@ class ChatEngine:
                 )
             )
             fix_signature = self._repair_fix_signature(repair_payloads)
-            duplicate_fix = bool(fix_signature) and fix_signature in repair_state.tried_fixes
+            is_duplicate_fix = bool(fix_signature) and fix_signature in repair_state.tried_fixes
+            if is_duplicate_fix and fix_signature not in improving_fix_signatures:
+                repair_history.append(
+                    {
+                        "attempt": attempt_no + 1,
+                        "hypothesis": str(hypothesis.get("hypothesis", "")).strip(),
+                        "suspected_files": hypothesis.get("suspected_files", []),
+                        "confidence": float(hypothesis.get("confidence", 0.0) or 0.0),
+                        "result": "failed",
+                        "impact": "no change",
+                        "before_total": int(before_snapshot.get("failed_tests", 0) or 0)
+                        + int(before_snapshot.get("test_errors", 0) or 0),
+                        "after_total": int(before_snapshot.get("failed_tests", 0) or 0)
+                        + int(before_snapshot.get("test_errors", 0) or 0),
+                        "outcome": "unchanged",
+                        "fix_signature": fix_signature,
+                        "skipped": "duplicate_fix_signature",
+                    }
+                )
+                continue
             if fix_signature:
                 repair_state.tried_fixes.append(fix_signature)
             validation = self._maybe_validate_workspace_after_step(
@@ -4185,11 +4426,20 @@ class ChatEngine:
                     "after_total": int(after_snapshot.get("failed_tests", 0) or 0)
                     + int(after_snapshot.get("test_errors", 0) or 0),
                     "outcome": outcome,
-                    "duplicate_fix": duplicate_fix,
+                    "fix_signature": fix_signature,
                 }
             )
+            if fix_signature and outcome in {"improved", "resolved"}:
+                improving_fix_signatures.add(fix_signature)
             signals = self._workspace_validation_signals(validation)
             if bool(signals.get("tests_passed", False)):
+                self._maybe_record_learned_root_cause(
+                    step=step,
+                    project_context=project_context,
+                    before_snapshot=before_snapshot,
+                    repair_payloads=repair_payloads,
+                    confidence=float(hypothesis.get("confidence", 0.6) or 0.6),
+                )
                 break
         return latest_text, combined_payloads, validation, repair_history
 

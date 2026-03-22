@@ -25,6 +25,19 @@ class _DummyTools:
         self.memory_store = memory_store
 
 
+class _StubLearningStore:
+    def __init__(self, matches=None):
+        self.matches = matches or []
+        self.upserts = []
+
+    def find_root_causes(self, error_text, context, limit=1):
+        return list(self.matches)[: max(1, int(limit))]
+
+    def upsert_root_cause(self, **kwargs):
+        self.upserts.append(dict(kwargs))
+        return {"ok": True, "created": True, "entry": kwargs}
+
+
 class TestStructuredPlanner(unittest.TestCase):
     def test_extract_explicit_file_paths_includes_directories(self):
         paths = ChatEngine._extract_explicit_file_paths(
@@ -672,6 +685,175 @@ class TestStructuredPlanner(unittest.TestCase):
         )
         self.assertGreaterEqual(len(history), 2)
         self.assertEqual(history[-1].get("skipped"), "duplicate_hypothesis")
+
+    def test_root_cause_error_text_includes_failed_tool_errors(self):
+        text = ChatEngine._extract_root_cause_error_text(
+            {"validation_signals": {}},
+            tool_payloads=[
+                {
+                    "tool": "execute_command",
+                    "result": {"ok": False, "error": "ModuleNotFoundError: requests"},
+                }
+            ],
+        )
+        self.assertIn("ModuleNotFoundError: requests", text)
+
+    def test_root_cause_fix_is_gated_by_match_score(self):
+        store = _StubLearningStore(
+            matches=[
+                {
+                    "id": "rc_low",
+                    "pattern": "ModuleNotFoundError: ${module}",
+                    "context": {"language": "python"},
+                    "fix_template": [
+                        {"tool": "execute_command", "args": {"cmd": "pip install requests"}}
+                    ],
+                    "confidence": 0.8,
+                    "score": 0.6,
+                }
+            ]
+        )
+        engine = ChatEngine(
+            model=_DummyModel(),
+            tools=_DummyTools(memory_store=store),
+            system_prompt="test",
+        )
+        solved, payloads, _, history = engine._maybe_apply_root_cause_fix(
+            step=PlanStep(step_id=1, action="fix imports"),
+            workspace_validation={
+                "validation_signals": {
+                    "failed_tests": 1,
+                    "test_errors": 0,
+                    "test_failures": [
+                        {"summary": "FAILED tests/test_app.py - ModuleNotFoundError: requests"}
+                    ],
+                }
+            },
+            current_tool_payloads=[],
+            project_context={"framework": "pytest"},
+            auto_metrics={"tool_calls": 0, "failed_tool_calls": 0},
+        )
+        self.assertFalse(solved)
+        self.assertEqual(payloads, [])
+        self.assertEqual(history.get("skipped"), "low_match_score")
+
+    def test_repair_loop_learns_root_cause_on_success(self):
+        store = _StubLearningStore()
+        engine = ChatEngine(
+            model=_DummyModel(),
+            tools=_DummyTools(memory_store=store),
+            system_prompt="test",
+        )
+        engine.autonomous_test_repair_attempts = 1
+        step = PlanStep(step_id=1, action="fix imports")
+        workspace_validation = {
+            "changed_files": ["app.py"],
+            "validation_signals": {
+                "tests_passed": False,
+                "failed_tests": 1,
+                "test_errors": 0,
+                "test_failures": [
+                    {
+                        "summary": "FAILED tests/test_app.py::test_boot - ModuleNotFoundError: requests"
+                    }
+                ],
+            },
+        }
+        engine._maybe_apply_root_cause_fix = lambda **kwargs: (False, [], workspace_validation, None)
+        engine._propose_test_failure_hypothesis = lambda **kwargs: {
+            "hypothesis": "missing dependency",
+            "suspected_files": ["app.py"],
+            "confidence": 0.8,
+        }
+        engine.handle_turn_stream = lambda *args, **kwargs: "patched"
+        engine._recent_tool_payloads = lambda limit=8: [
+            {
+                "tool": "execute_command",
+                "args": {"cmd": "pip install requests"},
+                "result": {"ok": True},
+            }
+        ]
+        engine._maybe_validate_workspace_after_step = lambda **kwargs: {
+            "validation_signals": {
+                "tests_passed": True,
+                "failed_tests": 0,
+                "test_errors": 0,
+            }
+        }
+
+        engine._maybe_run_test_driven_repair(
+            objective="fix import failures",
+            step=step,
+            workspace_validation=workspace_validation,
+            current_tool_payloads=[],
+            project_context={"framework": "pytest"},
+            auto_metrics={
+                "tool_calls": 0,
+                "failed_tool_calls": 0,
+                "test_repair_attempts": 0,
+                "est_tokens_out": 0,
+            },
+        )
+        self.assertEqual(len(store.upserts), 1)
+        self.assertEqual(store.upserts[0]["pattern"], "ModuleNotFoundError: ${module}")
+
+    def test_repair_loop_skips_duplicate_fix_signature(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        step = PlanStep(step_id=1, action="fix auth")
+        workspace_validation = {
+            "validation_signals": {
+                "tests_passed": False,
+                "failed_tests": 1,
+                "test_errors": 0,
+                "test_failures": [{"summary": "FAILED tests/test_auth.py::test_login - AssertionError"}],
+            }
+        }
+        engine.autonomous_test_repair_attempts = 2
+        engine._maybe_apply_root_cause_fix = lambda **kwargs: (False, [], workspace_validation, None)
+        hypotheses = [
+            {"hypothesis": "first fix", "suspected_files": ["auth.py"], "confidence": 0.7},
+            {"hypothesis": "second fix", "suspected_files": ["auth.py"], "confidence": 0.6},
+        ]
+        engine._propose_test_failure_hypothesis = lambda **kwargs: hypotheses.pop(0)
+        engine.handle_turn_stream = lambda *args, **kwargs: "patched"
+        engine._recent_tool_payloads = lambda limit=8: [
+            {"tool": "edit_file", "args": {"path": "auth.py"}, "result": {"ok": True}}
+        ]
+        engine._maybe_validate_workspace_after_step = lambda **kwargs: workspace_validation
+
+        _, _, _, history = engine._maybe_run_test_driven_repair(
+            objective="fix auth tests",
+            step=step,
+            workspace_validation=workspace_validation,
+            current_tool_payloads=[],
+            project_context={},
+            auto_metrics={
+                "tool_calls": 0,
+                "failed_tool_calls": 0,
+                "test_repair_attempts": 0,
+                "est_tokens_out": 0,
+            },
+        )
+        self.assertTrue(any(item.get("skipped") == "duplicate_fix_signature" for item in history))
+
+    def test_hybrid_planner_fills_missing_strategy_capabilities(self):
+        engine = ChatEngine(
+            model=_DummyModel(
+                response='{"steps":[{"id":3,"tool":"run_tests","args":{"path":".","runner":"pytest"},"depends_on":[2],"expected":"tests pass"}]}'
+            ),
+            tools=_DummyTools(),
+            system_prompt="test",
+        )
+        skeleton = [
+            PlanStep(step_id=1, action="search_project", args={"query": "auth"}, depends_on=[]),
+            PlanStep(step_id=2, action="edit_file", args={"path": "app.py"}, depends_on=[1]),
+        ]
+        engine._reuse_strategy_steps = lambda *args, **kwargs: skeleton
+        steps = engine._plan_objective_steps("fix failing tests", step_cap=4)
+        actions = [step.action for step in steps]
+        self.assertIn("run_tests", actions)
+        run_tests_step = next(step for step in steps if step.action == "run_tests")
+        self.assertIn(2, run_tests_step.depends_on)
 
 
 if __name__ == "__main__":

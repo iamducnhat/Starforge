@@ -273,6 +273,38 @@ class MemoryStore:
         self._root_cause_index = index
 
     @staticmethod
+    def _root_cause_bucket_filename(
+        pattern: str,
+        context: dict[str, Any] | None = None,
+        bucket_hint: str | None = None,
+    ) -> str:
+        hint = str(bucket_hint or "").strip().lower()
+        if hint in {"import_errors", "import_errors.json"}:
+            return "import_errors.json"
+        if hint in {"test_failures", "test_failures.json"}:
+            return "test_failures.json"
+
+        ctx = context if isinstance(context, dict) else {}
+        haystack = (
+            str(pattern or "").lower()
+            + " "
+            + json.dumps(ctx, ensure_ascii=False, sort_keys=True).lower()
+        )
+        import_tokens = (
+            "modulenotfounderror",
+            "importerror",
+            "cannot import",
+            "no module named",
+            "missing dependency",
+            "dependency",
+            "pip",
+            "package",
+        )
+        if any(token in haystack for token in import_tokens):
+            return "import_errors.json"
+        return "test_failures.json"
+
+    @staticmethod
     def _normalize_root_cause_entry(
         raw_entry: Any, *, path: Path, idx: int
     ) -> dict[str, Any] | None:
@@ -308,6 +340,19 @@ class MemoryStore:
             "fail_count": int(raw_entry.get("fail_count", 0) or 0),
             "confidence": max(0.0, min(confidence, 1.0)),
         }
+
+    @staticmethod
+    def _root_cause_fingerprint(
+        pattern: str,
+        context: dict[str, Any],
+        fix_template: list[dict[str, Any]],
+    ) -> str:
+        key_basis = json.dumps(
+            {"pattern": pattern, "context": context, "fix_template": fix_template},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return blake2b(key_basis.encode("utf-8"), digest_size=10).hexdigest()
 
     @staticmethod
     def _placeholder_pattern_to_regex(pattern: str) -> tuple[str, list[str]]:
@@ -577,6 +622,10 @@ class MemoryStore:
         scored.sort(key=lambda pair: pair[0], reverse=True)
         out: list[dict[str, Any]] = []
         for score, item in scored[: max(1, limit)]:
+            success_count = float(item.get("success_count", 0.0) or 0.0)
+            failure_count = float(item.get("failure_count", 0.0) or 0.0)
+            total = max(1.0, success_count + failure_count)
+            success_ratio = success_count / total
             out.append(
                 {
                     "id": item.get("id", ""),
@@ -682,6 +731,115 @@ class MemoryStore:
         ]
         write_json(path, serializable)
         return {"ok": True, "id": root_id, "entry": entry}
+
+    def upsert_root_cause(
+        self,
+        pattern: str,
+        context: dict[str, Any] | None,
+        fix_template: list[dict[str, Any]] | list[Any],
+        success: bool,
+        confidence: float,
+        source: str,
+        bucket_hint: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_pattern = str(pattern or "").strip()
+        if not normalized_pattern:
+            return {"ok": False, "error": "pattern must not be empty"}
+        normalized_context = context if isinstance(context, dict) else {}
+        normalized_fixes: list[dict[str, Any]] = []
+        for item in fix_template or []:
+            if not isinstance(item, dict):
+                continue
+            tool = str(item.get("tool", "")).strip()
+            args = item.get("args", {})
+            if not tool or not isinstance(args, dict):
+                continue
+            normalized_fixes.append({"tool": tool, "args": args})
+        if not normalized_fixes:
+            return {"ok": False, "error": "fix_template must include at least one tool call"}
+
+        bucket_name = self._root_cause_bucket_filename(
+            pattern=normalized_pattern,
+            context=normalized_context,
+            bucket_hint=bucket_hint,
+        )
+        bucket_path = self.root_causes_dir / bucket_name
+        if not bucket_path.exists():
+            write_json(bucket_path, [])
+
+        entries = list(self._root_cause_cache.get(bucket_name, []))
+        target_fp = self._root_cause_fingerprint(
+            normalized_pattern, normalized_context, normalized_fixes
+        )
+        match_idx = -1
+        for idx, item in enumerate(entries):
+            if not isinstance(item, dict):
+                continue
+            fp = self._root_cause_fingerprint(
+                str(item.get("pattern", "")).strip(),
+                item.get("context", {}) if isinstance(item.get("context"), dict) else {},
+                item.get("fix_template", [])
+                if isinstance(item.get("fix_template"), list)
+                else [],
+            )
+            if fp == target_fp:
+                match_idx = idx
+                break
+
+        conf = max(0.0, min(float(confidence), 1.0))
+        created = False
+        if match_idx >= 0:
+            entry = dict(entries[match_idx])
+            if success:
+                entry["success_count"] = int(entry.get("success_count", 0) or 0) + 1
+            else:
+                entry["fail_count"] = int(entry.get("fail_count", 0) or 0) + 1
+            current = float(entry.get("confidence", 0.5) or 0.5)
+            entry["confidence"] = round((current * 0.8) + (conf * 0.2), 4)
+            entries[match_idx] = entry
+        else:
+            created = True
+            entry_id = (
+                f"{bucket_path.stem}_"
+                f"{blake2b(target_fp.encode('utf-8'), digest_size=5).hexdigest()}"
+            )
+            entry = {
+                "id": entry_id,
+                "pattern": normalized_pattern,
+                "context": normalized_context,
+                "fix_template": normalized_fixes,
+                "success_count": 1 if success else 0,
+                "fail_count": 0 if success else 1,
+                "confidence": conf,
+            }
+            entries.append(entry)
+
+        serializable = [
+            {
+                "id": str(item.get("id", "")).strip(),
+                "pattern": str(item.get("pattern", "")).strip(),
+                "context": item.get("context", {})
+                if isinstance(item.get("context"), dict)
+                else {},
+                "fix_template": item.get("fix_template", [])
+                if isinstance(item.get("fix_template"), list)
+                else [],
+                "success_count": int(item.get("success_count", 0) or 0),
+                "fail_count": int(item.get("fail_count", 0) or 0),
+                "confidence": float(item.get("confidence", 0.0) or 0.0),
+            }
+            for item in entries
+            if isinstance(item, dict)
+        ]
+        write_json(bucket_path, serializable)
+        self._load_root_causes()
+        return {
+            "ok": True,
+            "bucket": bucket_name,
+            "created": created,
+            "source": str(source or "runtime"),
+            "entry": entry,
+        }
 
     def semantic_search(
         self, query: str, limit: int = 5, min_score: float = 0.1
