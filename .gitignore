@@ -13,10 +13,7 @@ __pycache__/
 .env
 
 # Runtime/generated memory & logs
-memory/tool_finetune_samples.jsonl
-memory/tool_supervision.jsonl
-memory/plans/*.json
-memory/blocks/
+memory/
 workspaces/
 memory/sessions/
 finetune/
