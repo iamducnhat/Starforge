@@ -6,13 +6,14 @@ import importlib.util
 import io
 import json
 import tokenize
+from collections import OrderedDict
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
 
-from .utils import (ensure_dir, normalize_keywords, read_json, slugify,
-                    utc_now_iso, write_json, write_text)
+from .utils import (ensure_dir, get_env_int, normalize_keywords, read_json,
+                    slugify, utc_now_iso, write_json, write_text)
 
 
 class FunctionRegistry:
@@ -20,26 +21,51 @@ class FunctionRegistry:
         self.functions_dir = Path(functions_dir)
         ensure_dir(self.functions_dir)
         self.skills_index_path = self.functions_dir / "_skills.json"
-        self._skills_cache: dict[str, dict[str, Any]] = {}
+        self._skills_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self.max_hot_skills = max(
+            32, min(get_env_int("ASSISTANT_MAX_HOT_SKILLS", 512), 8192)
+        )
         self._load_skills_index()
 
     def _load_skills_index(self) -> None:
         try:
             data = read_json(self.skills_index_path)
             if isinstance(data, dict):
-                self._skills_cache = {
+                self._skills_cache = OrderedDict(
+                    {
                     str(k): v for k, v in data.items() if isinstance(v, dict)
-                }
+                    }
+                )
             else:
-                self._skills_cache = {}
+                self._skills_cache = OrderedDict()
         except Exception:
-            self._skills_cache = {}
+            self._skills_cache = OrderedDict()
+        self._trim_skills_cache()
 
     def _save_skills_index(self) -> None:
         try:
             write_json(self.skills_index_path, self._skills_cache)
         except Exception:
             pass
+
+    def _trim_skills_cache(self) -> None:
+        if len(self._skills_cache) <= self.max_hot_skills:
+            return
+        ranked = sorted(
+            self._skills_cache.items(),
+            key=lambda pair: (
+                str(
+                    pair[1].get("last_success_at", "")
+                    or pair[1].get("last_used_at", "")
+                    or pair[1].get("updated_at", "")
+                    or pair[1].get("created_at", "")
+                ),
+                float(pair[1].get("success_count", 0.0) or 0.0)
+                - float(pair[1].get("failure_count", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        self._skills_cache = OrderedDict(ranked[: self.max_hot_skills])
 
     @staticmethod
     def _parse_iso_to_utc(value: str) -> datetime | None:
@@ -319,6 +345,10 @@ class FunctionRegistry:
         tool_name: str = "",
         tool_args: dict[str, Any] | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
+        skill: str = "",
+        inputs: list[str] | None = None,
+        steps_template: list[dict[str, Any]] | None = None,
+        match_conditions: list[str] | None = None,
     ) -> dict[str, Any]:
         result = self.create_function(
             name=name,
@@ -340,12 +370,34 @@ class FunctionRegistry:
         skill_id = slugify(name)
         now = utc_now_iso()
         existing = self._skills_cache.get(skill_id, {})
+        normalized_inputs = [
+            str(item).strip()
+            for item in (inputs or [])
+            if str(item).strip()
+        ]
+        normalized_steps_template: list[dict[str, Any]] = []
+        for item in steps_template or []:
+            if not isinstance(item, dict):
+                continue
+            raw_tool = item.get("tool") or item.get("name")
+            tool = str(raw_tool).strip() if isinstance(raw_tool, str) else ""
+            if not tool:
+                continue
+            args = item.get("args", {})
+            if not isinstance(args, dict):
+                args = {}
+            normalized_steps_template.append({"tool": tool, "args": args})
+        normalized_match_conditions = normalize_keywords(match_conditions or [])
         entry = {
             "id": skill_id,
             "name": name,
             "description": description,
             "keywords": normalize_keywords(keywords),
             "function_name": function_name,
+            "skill": str(skill).strip(),
+            "inputs": normalized_inputs,
+            "steps_template": normalized_steps_template,
+            "match_conditions": normalized_match_conditions,
             "created_at": existing.get("created_at", now),
             "updated_at": now,
             "success_count": int(existing.get("success_count", 0) or 0),
@@ -355,6 +407,8 @@ class FunctionRegistry:
             "last_success_at": existing.get("last_success_at", ""),
         }
         self._skills_cache[skill_id] = entry
+        self._skills_cache.move_to_end(skill_id)
+        self._trim_skills_cache()
         self._save_skills_index()
         return {
             "ok": True,
@@ -421,6 +475,8 @@ class FunctionRegistry:
         if notes.strip():
             skill["last_notes"] = notes.strip()[:600]
         self._skills_cache[skill_id] = skill
+        self._skills_cache.move_to_end(skill_id)
+        self._trim_skills_cache()
         self._save_skills_index()
         return {"ok": True, "skill": skill, "score": self._skill_rank(skill)}
 
@@ -435,6 +491,11 @@ class FunctionRegistry:
             changed = True
         if changed:
             self._save_skills_index()
+
+    def evict_cold_state(self) -> int:
+        before = len(self._skills_cache)
+        self._trim_skills_cache()
+        return max(0, before - len(self._skills_cache))
 
     def _execute_code_function(self, name: str, args: dict[str, Any]) -> Any:
         """

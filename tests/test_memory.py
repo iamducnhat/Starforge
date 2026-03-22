@@ -29,6 +29,39 @@ class TestMemoryStore(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["name"], "Test Block")
         self.assertEqual(results[0]["knowledge"], "This is a test knowledge block.")
+        self.assertNotIn("_knowledge", self.store._metadata_cache["test_block"])
+        self.assertEqual(
+            self.store._metadata_cache["test_block"]["_knowledge_size"],
+            len("This is a test knowledge block."),
+        )
+
+    def test_hot_knowledge_cache_is_bounded(self):
+        self.store.max_hot_knowledge_blocks = 2
+        self.store.create_block(
+            name="Block One",
+            topic="Testing",
+            keywords=["one"],
+            knowledge="first block",
+            source=[],
+        )
+        self.store.create_block(
+            name="Block Two",
+            topic="Testing",
+            keywords=["two"],
+            knowledge="second block",
+            source=[],
+        )
+        self.store.create_block(
+            name="Block Three",
+            topic="Testing",
+            keywords=["three"],
+            knowledge="third block",
+            source=[],
+        )
+        self.assertEqual(len(self.store._knowledge_cache), 2)
+        self.assertNotIn("block_one", self.store._knowledge_cache)
+        self.assertIn("block_two", self.store._knowledge_cache)
+        self.assertIn("block_three", self.store._knowledge_cache)
 
     def test_find_no_match(self):
         self.store.create_block(

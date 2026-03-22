@@ -38,6 +38,16 @@ class TestToolReliability(unittest.TestCase):
         self.assertEqual(result.get("value"), "recovered")
         self.assertEqual(result.get("attempts"), 2)
 
+    def test_search_web_normalization_keeps_persist_flag(self):
+        normalized = self.tool_system._normalize_tool_args(
+            "search_web",
+            {"query": "memory leak audit", "persist": True, "ignored": "x"},
+        )
+        self.assertEqual(
+            normalized,
+            {"query": "memory leak audit", "persist": True},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

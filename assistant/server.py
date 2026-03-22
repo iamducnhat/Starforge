@@ -376,7 +376,11 @@ async def chat_completions(request: ChatCompletionRequest):
     # ------------------------------------------------------------------
     # Streaming path
     # ------------------------------------------------------------------
-    chunk_queue: queue.Queue[dict | None] = queue.Queue()
+    chunk_queue: queue.Queue[dict | None] = queue.Queue(maxsize=2048)
+    stop_stream = threading.Event()
+    include_usage = bool(
+        request.stream_options and request.stream_options.get("include_usage")
+    )
 
     # Track whether we are inside <think>…</think> blocks.
     # Reasoning chunks are forwarded to the client as `reasoning_content` deltas
@@ -385,8 +389,27 @@ async def chat_completions(request: ChatCompletionRequest):
     # the regular `content` delta.
     state = {"in_reasoning": False}
 
+    def enqueue_chunk(item: dict | None, *, allow_overwrite: bool = False) -> None:
+        if stop_stream.is_set() and item is not None:
+            raise RuntimeError("stream cancelled")
+        try:
+            chunk_queue.put(item, timeout=0.25)
+            return
+        except queue.Full:
+            if allow_overwrite:
+                try:
+                    chunk_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                chunk_queue.put_nowait(item)
+                return
+            stop_stream.set()
+            raise RuntimeError("stream output queue exceeded limit")
+
     def on_chunk(chunk: str) -> None:
         """Called by handle_turn_stream for every text chunk emitted by the model."""
+        if stop_stream.is_set():
+            raise RuntimeError("stream cancelled")
         if chunk == "<think>":
             state["in_reasoning"] = True
             return
@@ -396,9 +419,9 @@ async def chat_completions(request: ChatCompletionRequest):
         if state["in_reasoning"]:
             # Forward thinking as reasoning_content so clients that support it
             # (e.g. Gemini Thinking, DeepSeek-R1) can display it.
-            chunk_queue.put({"type": "reasoning", "data": chunk})
+            enqueue_chunk({"type": "reasoning", "data": chunk})
         else:
-            chunk_queue.put({"type": "content", "data": chunk})
+            enqueue_chunk({"type": "content", "data": chunk})
 
     def run_engine() -> None:
         """Runs in a background thread – streams chunks into chunk_queue."""
@@ -410,10 +433,21 @@ async def chat_completions(request: ChatCompletionRequest):
                 on_tool=lambda name, args, result: print_tool_event(name, args, result),
             )
         except Exception as exc:
-            logger.exception("handle_turn_stream failed")
-            chunk_queue.put({"type": "content", "data": f"\n[Server error: {exc}]"})
+            if not stop_stream.is_set():
+                logger.exception("handle_turn_stream failed")
+                try:
+                    enqueue_chunk(
+                        {"type": "content", "data": f"\n[Server error: {exc}]"},
+                        allow_overwrite=True,
+                    )
+                except Exception:
+                    pass
         finally:
-            chunk_queue.put(None)  # sentinel – stream is done
+            stop_stream.set()
+            try:
+                enqueue_chunk(None, allow_overwrite=True)  # sentinel – stream is done
+            except Exception:
+                pass
 
     threading.Thread(target=run_engine, daemon=True).start()
 
@@ -434,9 +468,12 @@ async def chat_completions(request: ChatCompletionRequest):
         }
         yield f"data: {json.dumps(initial, ensure_ascii=False)}\n\n"
 
-        total_content = ""
+        completion_chars = 0
 
         while True:
+            if await request.is_disconnected():
+                stop_stream.set()
+                break
             item = await anyio.to_thread.run_sync(chunk_queue.get)
             if item is None:
                 break  # stream finished
@@ -446,8 +483,8 @@ async def chat_completions(request: ChatCompletionRequest):
             if not data_str:
                 continue
 
-            if item_type == "content":
-                total_content += data_str
+            if item_type == "content" and include_usage:
+                completion_chars += len(data_str)
 
             # reasoning_content is a standard extension (DeepSeek, Gemini Thinking).
             # Clients that don’t understand it silently ignore the key.
@@ -467,16 +504,12 @@ async def chat_completions(request: ChatCompletionRequest):
 
         # --- final [STOP] chunk ---
         prompt_tokens = sum(_token_estimate(m.content or "") for m in request.messages)
-        completion_tokens = _token_estimate(total_content)
+        completion_tokens = max(1, completion_chars // 4) if include_usage else 0
         usage = {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
         }
-
-        include_usage = bool(
-            request.stream_options and request.stream_options.get("include_usage")
-        )
 
         final_chunk = {
             "id": request_id,

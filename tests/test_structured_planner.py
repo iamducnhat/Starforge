@@ -1,3 +1,4 @@
+import json
 import unittest
 from pathlib import Path
 import shutil
@@ -25,6 +26,25 @@ class _DummyTools:
         self.memory_store = memory_store
 
 
+class _AutoTools:
+    def __init__(self, memory_store=None):
+        self.memory_store = memory_store
+
+    def execute(self, name, args):
+        if name == "detect_project_context":
+            return {"ok": False, "framework": "unknown", "test_runner": "unknown"}
+        return {"ok": True}
+
+
+class _CaptureTools:
+    def __init__(self):
+        self.calls = []
+
+    def execute(self, name, args):
+        self.calls.append((name, args))
+        return {"ok": True, "name": name}
+
+
 class _StubLearningStore:
     def __init__(self, matches=None):
         self.matches = matches or []
@@ -39,6 +59,38 @@ class _StubLearningStore:
 
 
 class TestStructuredPlanner(unittest.TestCase):
+    def test_autonomous_blocks_todo_plan_tools(self):
+        tools = _CaptureTools()
+        engine = ChatEngine(
+            model=_DummyModel(),
+            tools=tools,
+            system_prompt="test",
+        )
+        engine._autonomous_execution_active = True
+        result = engine._execute_tool_call_with_policy(
+            "auto run",
+            {"name": "update_todo", "args": {"plan_id": "1", "todo_id": 1, "status": "done"}},
+        )
+        self.assertTrue(result["ok"])
+        self.assertTrue(result.get("skipped"))
+        self.assertEqual(result.get("policy"), "autonomous_no_todo_tools")
+        self.assertEqual(tools.calls, [])
+
+    def test_autonomous_allows_non_todo_tools(self):
+        tools = _CaptureTools()
+        engine = ChatEngine(
+            model=_DummyModel(),
+            tools=tools,
+            system_prompt="test",
+        )
+        engine._autonomous_execution_active = True
+        result = engine._execute_tool_call_with_policy(
+            "auto run",
+            {"name": "read_file", "args": {"path": "README.md"}},
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(tools.calls, [("read_file", {"path": "README.md"})])
+
     def test_extract_explicit_file_paths_includes_directories(self):
         paths = ChatEngine._extract_explicit_file_paths(
             "check workspaces/crypto_research and read README.md"
@@ -854,6 +906,364 @@ class TestStructuredPlanner(unittest.TestCase):
         self.assertIn("run_tests", actions)
         run_tests_step = next(step for step in steps if step.action == "run_tests")
         self.assertIn(2, run_tests_step.depends_on)
+
+    def test_state_delta_classifies_improved_regressed_and_unchanged(self):
+        improved = ChatEngine._state_delta_from_snapshots(
+            before_snapshot={
+                "failed_tests": 3,
+                "test_errors": 0,
+                "signature": "a|b|c",
+                "failure_items": ["a", "b", "c"],
+            },
+            after_snapshot={
+                "failed_tests": 1,
+                "test_errors": 0,
+                "signature": "a",
+                "failure_items": ["a"],
+            },
+            workspace_validation={"changed_files": ["app.py"]},
+        )
+        self.assertEqual(improved["impact"], "improved")
+        self.assertTrue(improved["made_progress"])
+        self.assertEqual(improved["tests_fixed"], 2)
+
+        regressed = ChatEngine._state_delta_from_snapshots(
+            before_snapshot={
+                "failed_tests": 1,
+                "test_errors": 0,
+                "signature": "a",
+                "failure_items": ["a"],
+            },
+            after_snapshot={
+                "failed_tests": 3,
+                "test_errors": 0,
+                "signature": "a|b|c",
+                "failure_items": ["a", "b", "c"],
+            },
+            workspace_validation={"changed_files": ["app.py"]},
+        )
+        self.assertEqual(regressed["impact"], "regressed")
+        self.assertFalse(regressed["made_progress"])
+        self.assertEqual(regressed["new_errors"], 2)
+
+        unchanged = ChatEngine._state_delta_from_snapshots(
+            before_snapshot={
+                "failed_tests": 1,
+                "test_errors": 0,
+                "signature": "a",
+                "failure_items": ["a"],
+            },
+            after_snapshot={
+                "failed_tests": 1,
+                "test_errors": 0,
+                "signature": "a",
+                "failure_items": ["a"],
+            },
+            workspace_validation={"changed_files": []},
+        )
+        self.assertEqual(unchanged["impact"], "unchanged")
+        self.assertFalse(unchanged["made_progress"])
+
+    def test_resolve_action_retry_budget_escalates_and_replan_budget_stops(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        engine.autonomous_max_retries_per_step = 1
+        engine.autonomous_max_replans = 1
+        convergence_state = {"step_retry_counts": {}, "no_progress_streak": 0, "stop_reason": ""}
+        auto_metrics = {"replans": 0, "tool_calls": 0, "test_repair_attempts": 0}
+        step_fingerprint = "fix::{}"
+
+        action_1, _ = engine._resolve_autonomous_action(
+            proposed_action="retry",
+            proposed_reason="try again",
+            model_done=False,
+            model_bored=False,
+            validation_status="partial",
+            validation_score=0.45,
+            state_delta={"made_progress": False},
+            step_fingerprint=step_fingerprint,
+            convergence_state=convergence_state,
+            auto_metrics=auto_metrics,
+        )
+        self.assertEqual(action_1, "retry")
+
+        action_2, reason_2 = engine._resolve_autonomous_action(
+            proposed_action="retry",
+            proposed_reason="still failing",
+            model_done=False,
+            model_bored=False,
+            validation_status="partial",
+            validation_score=0.45,
+            state_delta={"made_progress": False},
+            step_fingerprint=step_fingerprint,
+            convergence_state=convergence_state,
+            auto_metrics=auto_metrics,
+        )
+        self.assertEqual(action_2, "replan")
+        self.assertIn("retry budget exceeded", reason_2)
+
+        auto_metrics["replans"] = 1
+        action_3, reason_3 = engine._resolve_autonomous_action(
+            proposed_action="retry",
+            proposed_reason="still failing",
+            model_done=False,
+            model_bored=False,
+            validation_status="partial",
+            validation_score=0.45,
+            state_delta={"made_progress": False},
+            step_fingerprint=step_fingerprint,
+            convergence_state=convergence_state,
+            auto_metrics=auto_metrics,
+        )
+        self.assertEqual(action_3, "bored")
+        self.assertIn("replan budget exceeded", reason_3)
+
+    def test_resolve_action_stops_on_global_tool_call_budget(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        engine.autonomous_max_tool_calls = 3
+        convergence_state = {"step_retry_counts": {}, "no_progress_streak": 0, "stop_reason": ""}
+        action, reason = engine._resolve_autonomous_action(
+            proposed_action="advance",
+            proposed_reason="ok",
+            model_done=False,
+            model_bored=False,
+            validation_status="success",
+            validation_score=0.9,
+            state_delta={"made_progress": True},
+            step_fingerprint="a::{}",
+            convergence_state=convergence_state,
+            auto_metrics={"replans": 0, "tool_calls": 3, "test_repair_attempts": 0},
+        )
+        self.assertEqual(action, "bored")
+        self.assertIn("tool-call budget reached", reason)
+
+    def test_no_progress_streak_forces_replan_even_if_reflection_retries(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        engine.autonomous_max_no_progress_streak = 2
+        convergence_state = {"step_retry_counts": {}, "no_progress_streak": 1, "stop_reason": ""}
+        action, reason = engine._resolve_autonomous_action(
+            proposed_action="retry",
+            proposed_reason="reflection wants retry",
+            model_done=False,
+            model_bored=False,
+            validation_status="partial",
+            validation_score=0.45,
+            state_delta={"made_progress": False},
+            step_fingerprint="fix::{}",
+            convergence_state=convergence_state,
+            auto_metrics={"replans": 0, "tool_calls": 1, "test_repair_attempts": 0},
+        )
+        self.assertEqual(action, "replan")
+        self.assertIn("no-progress streak", reason)
+
+    def test_replan_preserves_completed_steps_by_fingerprint(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        previous_steps = [
+            PlanStep(step_id=1, action="search_project", args={"query": "auth"}),
+            PlanStep(step_id=2, action="edit_file", args={"path": "app.py"}),
+            PlanStep(step_id=3, action="run_tests", args={"path": "."}),
+        ]
+        new_steps = [
+            PlanStep(step_id=10, action="search_project", args={"query": "auth"}),
+            PlanStep(step_id=11, action="edit_file", args={"path": "app.py"}),
+            PlanStep(step_id=12, action="run_tests", args={"path": "."}),
+        ]
+        preserved = engine._preserve_completed_step_ids(
+            previous_steps=previous_steps,
+            previous_completed_ids={1, 2},
+            new_steps=new_steps,
+        )
+        self.assertEqual(preserved, {10, 11})
+
+    def test_non_edit_execute_command_does_not_require_validation_tests(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        step = PlanStep(
+            step_id=1,
+            action="run pytest to capture failing tests",
+            args={"cmd": "pytest -q demo_project/tests"},
+        )
+        payloads = [
+            {
+                "tool": "execute_command",
+                "args": {"cmd": "pytest -q demo_project/tests"},
+                "result": {"ok": False, "exit_code": 1},
+            }
+        ]
+        self.assertFalse(engine._should_run_validation_tests(step, payloads))
+
+    def test_run_autonomous_forces_advance_for_non_edit_retry(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_AutoTools(), system_prompt="test")
+        engine.auto_stop_enabled = False
+        engine.autonomous_max_retries_per_step = 10
+        engine.autonomous_max_replans = 10
+        engine.autonomous_max_tool_calls = 0
+        engine.autonomous_max_repair_attempts_total = 0
+        engine.autonomous_max_no_progress_streak = 0
+
+        call_count = {"n": 0}
+        engine._create_task_state = lambda objective, step_cap=None: TaskState(
+            goal=objective,
+            steps=[
+                PlanStep(
+                    step_id=1,
+                    action="run pytest to capture failing tests",
+                    args={"cmd": "pytest -q demo_project/tests"},
+                )
+            ],
+            current_step=0,
+            completed_step_ids=set(),
+            history=[],
+        )
+
+        def _fake_turn(*args, **kwargs):
+            call_count["n"] += 1
+            return "Captured failing tests."
+
+        engine.handle_turn_stream = _fake_turn
+        engine._recent_tool_payloads = lambda limit=8: [
+            {
+                "tool": "execute_command",
+                "args": {"cmd": "pytest -q demo_project/tests"},
+                "result": {"ok": False, "exit_code": 1},
+            }
+        ]
+        engine._maybe_validate_workspace_after_step = lambda **kwargs: None
+        engine._maybe_run_test_driven_repair = (
+            lambda **kwargs: (
+                None,
+                kwargs.get("current_tool_payloads", []),
+                kwargs.get("workspace_validation"),
+                [],
+            )
+        )
+        engine._validate_autonomous_step_execution = lambda **kwargs: {
+            "status": "partial",
+            "score": 0.45,
+            "issues": [],
+            "ok_tools": 1,
+            "total_tools": 1,
+            "signals": {"expects_workspace_change": False},
+        }
+        engine._reflect_autonomous_progress = lambda **kwargs: {
+            "next_action": "replan",
+            "reason": "tool-call loop limit reached",
+            "confidence": 0.9,
+            "issues": [],
+            "new_steps": [],
+        }
+
+        engine.run_autonomous("capture failures", steps=2)
+        # Should advance and finish after one step instead of retrying step 1.
+        self.assertEqual(call_count["n"], 1)
+
+    def test_run_autonomous_retry_consumes_finite_step_budget(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_AutoTools(), system_prompt="test")
+        engine.auto_stop_enabled = False
+        engine.autonomous_max_retries_per_step = 10
+        engine.autonomous_max_replans = 10
+        engine.autonomous_max_tool_calls = 0
+        engine.autonomous_max_repair_attempts_total = 0
+        engine.autonomous_max_no_progress_streak = 0
+
+        call_count = {"n": 0}
+        engine._create_task_state = lambda objective, step_cap=None: TaskState(
+            goal=objective,
+            steps=[PlanStep(step_id=1, action="implement fix", args={"path": "app.py"})],
+            current_step=0,
+            completed_step_ids=set(),
+            history=[],
+        )
+
+        def _fake_turn(*args, **kwargs):
+            call_count["n"] += 1
+            return "Attempted fix."
+
+        engine.handle_turn_stream = _fake_turn
+        engine._recent_tool_payloads = lambda limit=8: [
+            {"tool": "edit_file", "args": {"path": "app.py"}, "result": {"ok": True}}
+        ]
+        engine._maybe_validate_workspace_after_step = lambda **kwargs: {
+            "ok": False,
+            "changed_files": ["app.py"],
+            "validation_signals": {
+                "tests_passed": False,
+                "failed_tests": 1,
+                "test_errors": 0,
+                "test_failures": [{"summary": "FAILED tests/test_app.py::test_auth"}],
+                "has_diff": True,
+                "changed_file_count": 1,
+            },
+        }
+        engine._maybe_run_test_driven_repair = (
+            lambda **kwargs: (
+                None,
+                kwargs.get("current_tool_payloads", []),
+                kwargs.get("workspace_validation"),
+                [],
+            )
+        )
+        engine._validate_autonomous_step_execution = lambda **kwargs: {
+            "status": "partial",
+            "score": 0.45,
+            "issues": [],
+            "ok_tools": 1,
+            "total_tools": 1,
+        }
+        engine._reflect_autonomous_progress = lambda **kwargs: {
+            "next_action": "retry",
+            "reason": "try again",
+            "confidence": 0.9,
+            "issues": [],
+            "new_steps": [],
+        }
+
+        engine.run_autonomous("stabilize auth flow", steps=2)
+        self.assertEqual(call_count["n"], 2)
+
+    def test_tool_history_payload_is_compacted(self):
+        large_stdout = "x" * 12000
+        engine = ChatEngine(
+            model=_DummyModel(
+                response='{"tool":"execute_command","args":{"cmd":"pytest -q demo_project/tests"}}'
+            ),
+            tools=_DummyTools(),
+            system_prompt="test",
+            max_tool_rounds=1,
+        )
+        engine._run_tool_call_with_reflection = lambda user_message, call: {
+            "name": "execute_command",
+            "args": {"cmd": "pytest -q demo_project/tests"},
+            "result": {
+                "ok": False,
+                "exit_code": 1,
+                "stdout": large_stdout,
+                "stderr": "",
+                "command": "pytest -q demo_project/tests",
+            },
+            "reflection": {"status": "failed"},
+            "initial_name": "execute_command",
+            "initial_args": {"cmd": "pytest -q demo_project/tests"},
+        }
+
+        engine.handle_turn("Fix tests", enforce_presearch=False, log_interaction=False)
+
+        tool_msgs = [m for m in engine.history if m.get("role") == "tool"]
+        self.assertEqual(len(tool_msgs), 1)
+        payload = json.loads(tool_msgs[0]["content"])
+        self.assertIn("result", payload)
+        stdout = payload["result"].get("stdout", "")
+        self.assertLessEqual(len(stdout), engine.max_history_tool_blob_chars)
+        self.assertEqual(payload["result"].get("exit_code"), 1)
+
+    def test_intent_cache_is_bounded(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        engine.max_intent_cache_size = 3
+        engine._ai_intent_flags = lambda user_message: {}
+
+        for i in range(10):
+            engine._intent_flags(f"intent message {i}")
+
+        self.assertLessEqual(len(engine._intent_cache), 3)
+        self.assertNotIn("intent message 0", engine._intent_cache)
 
 
 if __name__ == "__main__":

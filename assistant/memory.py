@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import math
 import re
-from hashlib import blake2b
+from collections import OrderedDict
 from datetime import datetime, timezone
+from hashlib import blake2b
 from pathlib import Path
 from typing import Any, Iterator
 
-from .utils import (ensure_dir, normalize_keywords, read_json, slugify,
-                    utc_now_iso, write_json, write_text)
+from .utils import (ensure_dir, get_env_int, normalize_keywords, read_json,
+                    slugify, utc_now_iso, write_json, write_text)
 
 
 class MemoryStore:
@@ -29,9 +30,19 @@ class MemoryStore:
         self.stats_path = self.blocks_dir / "_stats.json"
         self._metadata_cache: dict[str, dict[str, Any]] = {}
         self._stats_cache: dict[str, dict[str, Any]] = {}
-        self._strategy_cache: dict[str, dict[str, Any]] = {}
+        self._strategy_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._root_cause_cache: dict[str, list[dict[str, Any]]] = {}
         self._root_cause_index: dict[str, tuple[Path, int]] = {}
+        self._knowledge_cache: OrderedDict[str, str] = OrderedDict()
+        self.max_hot_knowledge_blocks = max(
+            16, min(get_env_int("ASSISTANT_MAX_HOT_KNOWLEDGE_BLOCKS", 128), 4096)
+        )
+        self.max_hot_strategies = max(
+            32, min(get_env_int("ASSISTANT_MAX_HOT_STRATEGIES", 512), 8192)
+        )
+        self.max_hot_root_causes_per_bucket = max(
+            64, min(get_env_int("ASSISTANT_MAX_HOT_ROOT_CAUSES_PER_BUCKET", 512), 8192)
+        )
         self._root_cause_seed_files = ("import_errors.json", "test_failures.json")
         self._load_stats()
         self._load_metadata()  # Initial load
@@ -177,13 +188,8 @@ class MemoryStore:
         semantic_score: float = 0.0,
         match_type: str = "keyword",
     ) -> dict[str, Any]:
-        knowledge = str(info.get("_knowledge", "")).strip()
-        if not knowledge:
-            knowledge_path = info["_knowledge_path"]
-            try:
-                knowledge = knowledge_path.read_text(encoding="utf-8").strip()
-            except Exception:
-                knowledge = "[Error reading knowledge content]"
+        knowledge_path = info["_knowledge_path"]
+        knowledge = self._load_knowledge_text(block_name, knowledge_path)
 
         return {
             "score": round(score, 3),
@@ -200,6 +206,68 @@ class MemoryStore:
             "created_at": info.get("created_at", ""),
             "knowledge": knowledge,
         }
+
+    def _remember_knowledge(self, block_name: str, knowledge_text: str) -> None:
+        self._knowledge_cache[block_name] = knowledge_text
+        self._knowledge_cache.move_to_end(block_name)
+        while len(self._knowledge_cache) > self.max_hot_knowledge_blocks:
+            self._knowledge_cache.popitem(last=False)
+
+    @staticmethod
+    def _strategy_sort_key(item: dict[str, Any]) -> tuple[float, float, str]:
+        success = float(item.get("success_count", 0.0) or 0.0)
+        failure = float(item.get("failure_count", 0.0) or 0.0)
+        updated = str(
+            item.get("last_success_at", "")
+            or item.get("last_used_at", "")
+            or item.get("updated_at", "")
+            or item.get("created_at", "")
+        )
+        return (success - failure, success, updated)
+
+    def _trim_strategy_cache(self) -> None:
+        if len(self._strategy_cache) <= self.max_hot_strategies:
+            return
+        ranked = sorted(
+            self._strategy_cache.items(),
+            key=lambda pair: self._strategy_sort_key(pair[1]),
+            reverse=True,
+        )
+        self._strategy_cache = OrderedDict(ranked[: self.max_hot_strategies])
+
+    @staticmethod
+    def _root_cause_sort_key(item: dict[str, Any]) -> tuple[float, float, float, str]:
+        success = float(item.get("success_count", 0.0) or 0.0)
+        failure = float(item.get("fail_count", 0.0) or 0.0)
+        confidence = float(item.get("confidence", 0.0) or 0.0)
+        pattern = str(item.get("pattern", ""))
+        return (confidence, success - failure, success, pattern)
+
+    def _load_root_cause_file(self, path: Path) -> list[dict[str, Any]]:
+        try:
+            payload = read_json(path)
+        except Exception:
+            payload = []
+        if not isinstance(payload, list):
+            payload = []
+        normalized: list[dict[str, Any]] = []
+        for idx, raw_entry in enumerate(payload):
+            entry = self._normalize_root_cause_entry(raw_entry, path=path, idx=idx)
+            if entry:
+                normalized.append(entry)
+        return normalized
+
+    def _load_knowledge_text(self, block_name: str, knowledge_path: Path) -> str:
+        cached = self._knowledge_cache.get(block_name)
+        if cached is not None:
+            self._knowledge_cache.move_to_end(block_name)
+            return cached
+        try:
+            knowledge = knowledge_path.read_text(encoding="utf-8").strip()
+        except Exception:
+            knowledge = "[Error reading knowledge content]"
+        self._remember_knowledge(block_name, knowledge)
+        return knowledge
 
     def _load_metadata(self) -> None:
         """Load or refresh the metadata cache from disk."""
@@ -220,7 +288,7 @@ class MemoryStore:
                 info["_embedding"] = self._embed_text(
                     self._build_embedding_source(info, knowledge_text)
                 )
-                info["_knowledge"] = knowledge_text
+                info["_knowledge_size"] = len(knowledge_text)
                 new_cache[block_dir.name] = info
             except Exception:
                 continue
@@ -255,20 +323,15 @@ class MemoryStore:
         cache: dict[str, list[dict[str, Any]]] = {}
         index: dict[str, tuple[Path, int]] = {}
         for path in self._root_cause_paths():
-            try:
-                payload = read_json(path)
-            except Exception:
-                payload = []
-            if not isinstance(payload, list):
-                payload = []
-            normalized: list[dict[str, Any]] = []
-            for idx, raw_entry in enumerate(payload):
-                entry = self._normalize_root_cause_entry(raw_entry, path=path, idx=idx)
-                if not entry:
-                    continue
-                normalized.append(entry)
-                index[entry["id"]] = (path, len(normalized) - 1)
-            cache[path.name] = normalized
+            normalized = self._load_root_cause_file(path)
+            ranked = sorted(
+                normalized,
+                key=self._root_cause_sort_key,
+                reverse=True,
+            )[: self.max_hot_root_causes_per_bucket]
+            for idx, entry in enumerate(ranked):
+                index[entry["id"]] = (path, idx)
+            cache[path.name] = ranked
         self._root_cause_cache = cache
         self._root_cause_index = index
 
@@ -507,7 +570,7 @@ class MemoryStore:
         return "\n".join(part for part in parts if part)
 
     def _load_strategies(self) -> None:
-        cache: dict[str, dict[str, Any]] = {}
+        cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         for path in sorted(self.strategies_dir.glob("*.json")):
             try:
                 item = read_json(path)
@@ -521,6 +584,7 @@ class MemoryStore:
             item["_embedding"] = self._embed_text(self._strategy_embedding_source(item))
             cache[strategy_id] = item
         self._strategy_cache = cache
+        self._trim_strategy_cache()
 
     def record_strategy(
         self,
@@ -587,6 +651,8 @@ class MemoryStore:
         entry["_path"] = str(path)
         entry["_embedding"] = self._embed_text(self._strategy_embedding_source(entry))
         self._strategy_cache[strategy_id] = entry
+        self._strategy_cache.move_to_end(strategy_id)
+        self._trim_strategy_cache()
         return {"ok": True, "strategy": entry}
 
     def find_strategies(
@@ -699,12 +765,26 @@ class MemoryStore:
         if not root_id:
             return {"ok": False, "error": "root_cause_id is required"}
         located = self._root_cause_index.get(root_id)
-        if located is None:
+        path = located[0] if located is not None else None
+        if path is None:
+            for candidate in self._root_cause_paths():
+                entries = self._load_root_cause_file(candidate)
+                if any(str(item.get("id", "")).strip() == root_id for item in entries):
+                    path = candidate
+                    break
+        if path is None:
             return {"ok": False, "error": f"unknown root cause id: {root_id}"}
-        path, idx = located
-        entries = self._root_cause_cache.get(path.name, [])
-        if idx < 0 or idx >= len(entries):
-            return {"ok": False, "error": f"root cause not found in cache: {root_id}"}
+        entries = self._load_root_cause_file(path)
+        idx = next(
+            (
+                i
+                for i, item in enumerate(entries)
+                if str(item.get("id", "")).strip() == root_id
+            ),
+            -1,
+        )
+        if idx < 0:
+            return {"ok": False, "error": f"root cause not found in storage: {root_id}"}
         entry = entries[idx]
         if success:
             entry["success_count"] = int(entry.get("success_count", 0) or 0) + 1
@@ -730,6 +810,7 @@ class MemoryStore:
             for item in entries
         ]
         write_json(path, serializable)
+        self._load_root_causes()
         return {"ok": True, "id": root_id, "entry": entry}
 
     def upsert_root_cause(
@@ -767,7 +848,7 @@ class MemoryStore:
         if not bucket_path.exists():
             write_json(bucket_path, [])
 
-        entries = list(self._root_cause_cache.get(bucket_name, []))
+        entries = self._load_root_cause_file(bucket_path)
         target_fp = self._root_cause_fingerprint(
             normalized_pattern, normalized_context, normalized_fixes
         )
@@ -839,6 +920,23 @@ class MemoryStore:
             "created": created,
             "source": str(source or "runtime"),
             "entry": entry,
+        }
+
+    def evict_cold_state(self) -> dict[str, int]:
+        knowledge_before = len(self._knowledge_cache)
+        strategy_before = len(self._strategy_cache)
+        root_before = sum(len(entries) for entries in self._root_cause_cache.values())
+        self._knowledge_cache.clear()
+        self._load_strategies()
+        self._load_root_causes()
+        return {
+            "knowledge_evicted": max(0, knowledge_before - len(self._knowledge_cache)),
+            "strategy_evicted": max(0, strategy_before - len(self._strategy_cache)),
+            "root_cause_evicted": max(
+                0,
+                root_before
+                - sum(len(entries) for entries in self._root_cause_cache.values()),
+            ),
         }
 
     def semantic_search(
@@ -999,8 +1097,9 @@ class MemoryStore:
         info_copy["_embedding"] = self._embed_text(
             self._build_embedding_source(info, knowledge.strip())
         )
-        info_copy["_knowledge"] = knowledge.strip()
+        info_copy["_knowledge_size"] = len(knowledge.strip())
         self._metadata_cache[block_name] = info_copy
+        self._remember_knowledge(block_name, knowledge.strip())
 
         return {
             "ok": True,

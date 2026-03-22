@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
 import re
+import sys
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import resource
 
 from .cli_format import (StreamRenderer, extract_answer_text,
                          print_answer_only, print_formatted_output,
                          print_phase, print_tool_event, print_tool_start)
-from .model import BaseModel
+from .model import BaseModel, clear_dns_cache
 from .tool_calls import parse_tool_calls
 from .tools import ToolSystem
 from .utils import get_env_bool, get_env_float, get_env_int, parse_json_payload
@@ -140,12 +144,43 @@ class ChatEngine:
         self._intent_cache: dict[str, dict[str, Any]] = {}
         self.compact_context_enabled = get_env_bool("ASSISTANT_COMPACT_CONTEXT", True)
         self.max_context_chars = get_env_int("ASSISTANT_MAX_CONTEXT_CHARS", 180000)
+        self.max_history_entry_chars = max(
+            800, min(get_env_int("ASSISTANT_HISTORY_ENTRY_MAX_CHARS", 4000), 50000)
+        )
+        self.max_history_tool_blob_chars = max(
+            400,
+            min(get_env_int("ASSISTANT_HISTORY_TOOL_BLOB_MAX_CHARS", 2500), 50000),
+        )
+        self.max_history_collection_items = max(
+            5, min(get_env_int("ASSISTANT_HISTORY_COLLECTION_MAX_ITEMS", 30), 200)
+        )
+        self.max_history_object_keys = max(
+            5, min(get_env_int("ASSISTANT_HISTORY_OBJECT_MAX_KEYS", 40), 200)
+        )
+        self.max_history_value_depth = max(
+            2, min(get_env_int("ASSISTANT_HISTORY_VALUE_MAX_DEPTH", 5), 12)
+        )
+        self.max_intent_cache_size = max(
+            32, min(get_env_int("ASSISTANT_INTENT_CACHE_SIZE", 256), 5000)
+        )
         self.compacted_context_note = ""
         self.auto_stop_enabled = False
         self.tool_reflection_enabled = get_env_bool("ASSISTANT_TOOL_REFLECTION", True)
         self.autonomous_plan_step_cap = get_env_int("ASSISTANT_PLAN_STEP_CAP", 8)
         self.execution_validation_threshold = max(
             0.0, min(get_env_float("ASSISTANT_EXEC_VALIDATION_THRESHOLD", 0.55), 1.0)
+        )
+        self.autonomous_max_retries_per_step = max(
+            0, min(get_env_int("ASSISTANT_AUTO_MAX_RETRIES_PER_STEP", 2), 20)
+        )
+        self.autonomous_max_replans = max(
+            0, min(get_env_int("ASSISTANT_AUTO_MAX_REPLANS", 2), 20)
+        )
+        self.autonomous_max_tool_calls = max(
+            0, get_env_int("ASSISTANT_AUTO_MAX_TOOL_CALLS", 0)
+        )
+        self.autonomous_max_no_progress_streak = max(
+            0, min(get_env_int("ASSISTANT_AUTO_MAX_NO_PROGRESS_STREAK", 2), 20)
         )
         self.autonomous_skill_learning_enabled = get_env_bool(
             "ASSISTANT_AUTO_LEARN_SKILLS", True
@@ -159,9 +194,27 @@ class ChatEngine:
         self.autonomous_token_budget = max(
             0, get_env_int("ASSISTANT_AUTO_TOKEN_BUDGET", 0)
         )
+        self.autonomous_state_history_limit = max(
+            50, min(get_env_int("ASSISTANT_AUTO_STATE_HISTORY_LIMIT", 300), 5000)
+        )
+        self.memory_soft_limit_mb = max(
+            0, get_env_int("ASSISTANT_MEMORY_SOFT_LIMIT_MB", 1536)
+        )
+        self.memory_hard_limit_mb = max(
+            self.memory_soft_limit_mb,
+            get_env_int("ASSISTANT_MEMORY_HARD_LIMIT_MB", 2048),
+        )
+        self.memory_guard_cooldown_s = max(
+            1.0, min(get_env_float("ASSISTANT_MEMORY_GUARD_COOLDOWN_S", 15.0), 300.0)
+        )
+        self.max_learned_signatures = max(
+            32, min(get_env_int("ASSISTANT_MAX_LEARNED_SIGNATURES", 256), 4096)
+        )
+        self._last_memory_guard_at = 0.0
         self.interaction_logging_enabled = get_env_bool(
             "ASSISTANT_LOG_INTERACTIONS", True
         )
+        self._autonomous_execution_active = False
         # Set to a callable (e.g. cli_format.print_phase) to display internal
         # phase labels in the CLI.  Left as None in server mode to stay silent.
         self.on_status: Callable[[str], None] | None = None
@@ -173,6 +226,100 @@ class ChatEngine:
                 self.on_status(label)
             except Exception:
                 pass
+
+    @staticmethod
+    def _memory_usage_bytes() -> int:
+        try:
+            with open("/proc/self/statm", "r", encoding="utf-8") as f:
+                parts = f.read().strip().split()
+            if len(parts) >= 2:
+                return int(parts[1]) * os.sysconf("SC_PAGE_SIZE")
+        except Exception:
+            pass
+        try:
+            rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss or 0)
+        except Exception:
+            return 0
+        if sys.platform == "darwin":
+            return rss
+        return rss * 1024
+
+    def _cleanup_for_memory_pressure(self) -> dict[str, Any]:
+        cleanup: dict[str, Any] = {}
+        try:
+            self._compact_context_if_needed()
+        except Exception:
+            pass
+        workspace_tools = getattr(self.tools, "workspace_tools", None)
+        if workspace_tools is not None and hasattr(workspace_tools, "close_idle_terminals"):
+            try:
+                cleanup["closed_terminals"] = int(
+                    workspace_tools.close_idle_terminals(max_idle_s=0)
+                )
+            except Exception:
+                cleanup["closed_terminals"] = 0
+        memory_store = getattr(self.tools, "memory_store", None)
+        if memory_store is not None and hasattr(memory_store, "evict_cold_state"):
+            try:
+                cleanup["memory_store"] = memory_store.evict_cold_state()
+            except Exception:
+                cleanup["memory_store"] = {}
+        function_registry = getattr(self.tools, "function_registry", None)
+        if function_registry is not None and hasattr(function_registry, "evict_cold_state"):
+            try:
+                cleanup["skills_evicted"] = int(function_registry.evict_cold_state())
+            except Exception:
+                cleanup["skills_evicted"] = 0
+        try:
+            cleanup["dns_entries_cleared"] = int(clear_dns_cache())
+        except Exception:
+            cleanup["dns_entries_cleared"] = 0
+        gc.collect()
+        return cleanup
+
+    def _maybe_enforce_memory_limits(
+        self, *, force: bool = False, context: str = ""
+    ) -> None:
+        if self.memory_soft_limit_mb <= 0 and self.memory_hard_limit_mb <= 0:
+            return
+        now = time.time()
+        if not force and (now - self._last_memory_guard_at) < self.memory_guard_cooldown_s:
+            return
+        self._last_memory_guard_at = now
+        rss_before = self._memory_usage_bytes()
+        soft_limit = self.memory_soft_limit_mb * 1024 * 1024
+        hard_limit = self.memory_hard_limit_mb * 1024 * 1024
+        if soft_limit > 0 and rss_before < soft_limit:
+            return
+        cleanup = self._cleanup_for_memory_pressure()
+        rss_after = self._memory_usage_bytes()
+        detail = (
+            f"context={context or 'runtime'}, "
+            f"rss_before_mb={rss_before // (1024 * 1024)}, "
+            f"rss_after_mb={rss_after // (1024 * 1024)}, "
+            f"cleanup={cleanup}"
+        )
+        self._status(f"memory guard: {detail}")
+        if hard_limit > 0 and rss_after >= hard_limit:
+            raise MemoryError(
+                "memory guard exceeded hard limit: "
+                f"{rss_after // (1024 * 1024)}MB >= {self.memory_hard_limit_mb}MB"
+            )
+
+    def _remember_learned_signature(
+        self, learned_signatures: OrderedDict[str, None], signature: str
+    ) -> bool:
+        normalized = str(signature or "").strip()
+        if not normalized:
+            return False
+        if normalized in learned_signatures:
+            learned_signatures.move_to_end(normalized)
+            return False
+        learned_signatures[normalized] = None
+        learned_signatures.move_to_end(normalized)
+        while len(learned_signatures) > self.max_learned_signatures:
+            learned_signatures.popitem(last=False)
+        return True
 
     # ------------------------------------------------------------------
     # Session persistence
@@ -1594,6 +1741,19 @@ class ChatEngine:
     ) -> dict[str, Any]:
         name = call["name"]
         args = call.get("args", {})
+        if self._autonomous_execution_active and name in {
+            "create_plan",
+            "list_plans",
+            "get_plan",
+            "add_todo",
+            "update_todo",
+        }:
+            return {
+                "ok": True,
+                "skipped": True,
+                "policy": "autonomous_no_todo_tools",
+                "message": f"{name} skipped during autonomous execution.",
+            }
         if name == "create_function" and self._prefer_copyable_function_reply(
             user_message
         ):
@@ -1889,6 +2049,14 @@ class ChatEngine:
                     merged[k] = v
             elif isinstance(v, bool):
                 merged[k] = v
+        if len(self._intent_cache) >= self.max_intent_cache_size:
+            overflow = (len(self._intent_cache) - self.max_intent_cache_size) + 1
+            for _ in range(max(1, overflow)):
+                try:
+                    oldest_key = next(iter(self._intent_cache))
+                except StopIteration:
+                    break
+                self._intent_cache.pop(oldest_key, None)
         self._intent_cache[key] = merged
         return merged
 
@@ -2346,6 +2514,86 @@ class ChatEngine:
         msgs.extend(self.history[-self.max_history :])
         return msgs
 
+    @staticmethod
+    def _clip_text(text: str, limit: int) -> str:
+        if limit <= 0 or len(text) <= limit:
+            return text
+        clipped_chars = len(text) - limit
+        suffix = f"\n...[truncated {clipped_chars} chars]"
+        head_limit = max(0, limit - len(suffix))
+        return text[:head_limit] + suffix
+
+    def _history_string_limit(self, key_hint: str) -> int:
+        key = key_hint.lower().strip()
+        if key in {
+            "stdout",
+            "stderr",
+            "content",
+            "diff",
+            "patch",
+            "traceback",
+            "errors",
+            "matches",
+            "files",
+            "symbols",
+        }:
+            return self.max_history_tool_blob_chars
+        if key in {"text", "error", "reason"}:
+            return max(200, min(self.max_history_entry_chars, 1200))
+        return self.max_history_entry_chars
+
+    def _compact_history_value(
+        self, value: Any, key_hint: str = "", depth: int = 0
+    ) -> Any:
+        if depth >= self.max_history_value_depth:
+            return "<truncated: depth limit>"
+
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            return self._clip_text(value, self._history_string_limit(key_hint))
+        if isinstance(value, dict):
+            items = list(value.items())
+            out: dict[str, Any] = {}
+            for idx, (k, v) in enumerate(items):
+                if idx >= self.max_history_object_keys:
+                    break
+                key_text = str(k)
+                out[key_text] = self._compact_history_value(
+                    v, key_hint=key_text, depth=depth + 1
+                )
+            if len(items) > self.max_history_object_keys:
+                out["_truncated_keys"] = len(items) - self.max_history_object_keys
+            return out
+        if isinstance(value, (list, tuple)):
+            items = list(value)
+            out_items = [
+                self._compact_history_value(item, key_hint=key_hint, depth=depth + 1)
+                for item in items[: self.max_history_collection_items]
+            ]
+            if len(items) > self.max_history_collection_items:
+                out_items.append(
+                    {"_truncated_items": len(items) - self.max_history_collection_items}
+                )
+            return out_items
+        return self._clip_text(str(value), self.max_history_entry_chars)
+
+    def _compact_tool_payload_for_history(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        compact = self._compact_history_value(payload, key_hint="tool_payload", depth=0)
+        if isinstance(compact, dict):
+            return compact
+        return {"tool": "unknown", "result": {"ok": False, "error": "invalid payload"}}
+
+    def _append_history_message(self, role: str, content: str) -> None:
+        text = content if isinstance(content, str) else str(content)
+        limit = self.max_history_entry_chars
+        if role == "tool":
+            # Tool payloads are already compacted to structured JSON.
+            limit = max(self.max_history_entry_chars, self.max_history_tool_blob_chars * 2)
+        self.history.append({"role": role, "content": self._clip_text(text, limit)})
+
     def _compact_context_if_needed(self) -> None:
         if not self.compact_context_enabled:
             return
@@ -2429,7 +2677,8 @@ class ChatEngine:
         enforce_presearch: bool = True,
         log_interaction: bool = True,
     ) -> str:
-        self.history.append({"role": "user", "content": user_message})
+        self._maybe_enforce_memory_limits(context="handle_turn:start")
+        self._append_history_message("user", user_message)
         continue_after_tools = False
         emergency_tools_used = False
         tools_executed_this_turn = False
@@ -2604,7 +2853,7 @@ class ChatEngine:
                     else:
                         if pending_nonthink:
                             on_chunk(pending_nonthink)
-                        self.history.append({"role": "assistant", "content": clean})
+                        self._append_history_message("assistant", clean)
                         if log_interaction:
                             self._log_interaction_trajectory(
                                 source="chat_turn",
@@ -2614,12 +2863,10 @@ class ChatEngine:
                                 tool_payloads=turn_tool_payloads,
                                 assistant_action=assistant_action_text,
                             )
+                        self._maybe_enforce_memory_limits(context="handle_turn:final")
                         return assistant_text
 
-            self.history.append({"role": "assistant", "content": assistant_text})
-            self.history[-1]["content"] = self._strip_thinking(
-                self.history[-1]["content"]
-            )
+            self._append_history_message("assistant", self._strip_thinking(assistant_text))
             assistant_action_text = self._canonical_tool_call_json(tool_calls)
             self._log_tool_training_sample(
                 user_message=user_message,
@@ -2691,13 +2938,12 @@ class ChatEngine:
                     "reflection": executed.get("reflection", {}),
                     "result": result,
                 }
-                self.history.append(
-                    {
-                        "role": "tool",
-                        "content": json.dumps(tool_payload, ensure_ascii=False),
-                    }
+                compact_payload = self._compact_tool_payload_for_history(tool_payload)
+                self._append_history_message(
+                    "tool",
+                    json.dumps(compact_payload, ensure_ascii=False),
                 )
-                turn_tool_payloads.append(tool_payload)
+                turn_tool_payloads.append(compact_payload)
             tools_executed_this_turn = True
             continue_after_tools = True
 
@@ -2705,7 +2951,7 @@ class ChatEngine:
             self._fallback_answer_from_tools()
             or "Tool-call loop limit reached. Return direct answer."
         )
-        self.history.append({"role": "assistant", "content": final_text})
+        self._append_history_message("assistant", final_text)
         if log_interaction:
             self._log_interaction_trajectory(
                 source="chat_turn",
@@ -2715,6 +2961,7 @@ class ChatEngine:
                 tool_payloads=turn_tool_payloads,
                 assistant_action=assistant_action_text,
             )
+        self._maybe_enforce_memory_limits(context="handle_turn:loop_limit")
         return final_text
 
     def run_cli(self) -> None:
@@ -3076,7 +3323,7 @@ class ChatEngine:
         print("[auto] plan:")
         for idx, step in enumerate(state.steps, start=1):
             print(f"  {idx}. {step.short_label()}")
-        learned_signatures: set[str] = set()
+        learned_signatures: OrderedDict[str, None] = OrderedDict()
         auto_metrics = {
             "tool_calls": 0,
             "failed_tool_calls": 0,
@@ -3109,9 +3356,16 @@ class ChatEngine:
         stale_count = 0
         last_text = ""
         rate_limit_count = 0
+        convergence_state = {
+            "step_retry_counts": {},
+            "no_progress_streak": 0,
+            "stop_reason": "",
+        }
         i = 0
+        self._autonomous_execution_active = True
         try:
             while True:
+                self._maybe_enforce_memory_limits(context="autonomous:loop")
                 next_idx = state.next_runnable_index()
                 if next_idx is None:
                     if finite_steps:
@@ -3169,6 +3423,7 @@ class ChatEngine:
                     + f"Current plan step ({state.current_step + 1}/{len(state.steps)}): {current_step.short_label()}\n"
                     + f"Current step args: {json.dumps(current_step.args, ensure_ascii=False)}\n"
                     + "Execute this current plan step now. Use tools as needed and stay in workspace root only.\n"
+                    + "Do not call planning/todo tools during execution: create_plan, list_plans, get_plan, add_todo, update_todo.\n"
                     + "After execution, include a short status sentence.\n"
                     + "If finished, output a final line that starts with: AUTONOMOUS_DONE\n"
                     + "If no useful next action remains, output a final line that starts with: AUTONOMOUS_BORED"
@@ -3306,10 +3561,30 @@ class ChatEngine:
                     action = "done"
                 if model_bored and action not in {"retry", "replan"}:
                     action = "bored"
-                if validation_score < self.execution_validation_threshold and action in {
-                    "advance",
-                    "done",
-                }:
+                validation_signals = validation.get("signals", {})
+                if isinstance(validation_signals, dict) and "expects_workspace_change" in validation_signals:
+                    expects_workspace_change = bool(
+                        validation_signals.get("expects_workspace_change", False)
+                    )
+                else:
+                    expects_workspace_change = self._should_run_validation_tests(
+                        current_step,
+                        tool_payloads,
+                    )
+                if (
+                    not expects_workspace_change
+                    and action in {"retry", "replan"}
+                    and validation_status in {"partial", "success"}
+                ):
+                    action = "advance"
+                    reason = (
+                        f"{reason} | non-edit step: forcing advance"
+                    ).strip(" |")
+                if (
+                    expects_workspace_change
+                    and validation_score < self.execution_validation_threshold
+                    and action in {"advance", "done"}
+                ):
                     action = "retry" if validation_status == "partial" else "replan"
                     validator_reason = (
                         f"validator gate: status={validation_status}, score={validation_score:.2f} "
@@ -3320,16 +3595,46 @@ class ChatEngine:
                         if reason
                         else validator_reason
                     )
+                step_fingerprint = self._plan_step_fingerprint(current_step)
+                current_snapshot = self._test_failure_snapshot(workspace_validation)
+                previous_snapshot: dict[str, Any] = {}
+                for item in reversed(state.history):
+                    if str(item.get("step_fingerprint", "")).strip() != step_fingerprint:
+                        continue
+                    snapshot = item.get("test_snapshot")
+                    if isinstance(snapshot, dict):
+                        previous_snapshot = snapshot
+                        break
+                state_delta = self._state_delta_from_snapshots(
+                    before_snapshot=previous_snapshot,
+                    after_snapshot=current_snapshot,
+                    workspace_validation=workspace_validation,
+                )
+                action, reason = self._resolve_autonomous_action(
+                    proposed_action=action,
+                    proposed_reason=reason,
+                    model_done=model_done,
+                    model_bored=model_bored,
+                    validation_status=validation_status,
+                    validation_score=validation_score,
+                    state_delta=state_delta,
+                    step_fingerprint=step_fingerprint,
+                    convergence_state=convergence_state,
+                    auto_metrics=auto_metrics,
+                )
                 state.history.append(
                     {
                         "loop_step": i,
                         "plan_index": state.current_step,
                         "plan_step": current_step.short_label(),
+                        "step_fingerprint": step_fingerprint,
                         "action": action,
                         "reason": reason,
                         "confidence": round(confidence, 3),
                         "issues": issues[:5],
                         "validator": validation,
+                        "test_snapshot": current_snapshot,
+                        "state_delta": state_delta,
                         "model_done_hint": model_done,
                         "model_bored_hint": model_bored,
                         "tool_signature": tool_signature,
@@ -3337,6 +3642,10 @@ class ChatEngine:
                         "metrics": dict(auto_metrics),
                     }
                 )
+                if len(state.history) > self.autonomous_state_history_limit:
+                    del state.history[
+                        : len(state.history) - self.autonomous_state_history_limit
+                    ]
                 self._log_interaction_trajectory(
                     source="autonomous_step",
                     goal=objective,
@@ -3392,6 +3701,8 @@ class ChatEngine:
                     return
                 if action == "replan":
                     auto_metrics["replans"] += 1
+                    previous_steps = list(state.steps)
+                    previous_completed_ids = set(state.completed_step_ids)
                     new_steps = progress.get("new_steps", [])
                     if isinstance(new_steps, list) and new_steps:
                         state.steps = self._validate_plan_steps(
@@ -3400,9 +3711,16 @@ class ChatEngine:
                         )
                     else:
                         state.steps = self._plan_objective_steps(objective, step_cap=plan_cap)
+                    state.completed_step_ids = self._preserve_completed_step_ids(
+                        previous_steps=previous_steps,
+                        previous_completed_ids=previous_completed_ids,
+                        new_steps=state.steps,
+                    )
+                    for step in state.steps:
+                        if step.step_id in state.completed_step_ids:
+                            step.status = "done"
                     state.refresh_dependency_order()
                     state.current_step = 0
-                    state.completed_step_ids = set()
                     if reason:
                         print(f"[auto] replanned: {reason}")
                     else:
@@ -3410,8 +3728,6 @@ class ChatEngine:
                 elif action == "retry":
                     auto_metrics["retries"] += 1
                     current_step.status = "pending"
-                    if finite_steps:
-                        i -= 1
                     if reason:
                         print(f"[auto] retrying current step: {reason}")
                     else:
@@ -3456,6 +3772,8 @@ class ChatEngine:
             print("\n[auto] interrupted (^C)")
             self._print_auto_metrics(auto_metrics)
             return
+        finally:
+            self._autonomous_execution_active = False
 
     def _recent_tool_payloads(self, limit: int = 8) -> list[dict[str, Any]]:
         payloads: list[dict[str, Any]] = []
@@ -3484,6 +3802,170 @@ class ChatEngine:
                 continue
             parts.append(f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}")
         return "|".join(sorted(parts))
+
+    @staticmethod
+    def _plan_step_fingerprint(step: PlanStep) -> str:
+        action = str(step.action or "").strip().lower()
+        try:
+            args_blob = json.dumps(step.args or {}, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            args_blob = "{}"
+        return f"{action}::{args_blob}"
+
+    @staticmethod
+    def _snapshot_failure_items(snapshot: dict[str, Any]) -> list[str]:
+        if not isinstance(snapshot, dict):
+            return []
+        raw_items = snapshot.get("failure_items", [])
+        if isinstance(raw_items, list) and raw_items:
+            return [str(item).strip() for item in raw_items if str(item).strip()]
+        signature = str(snapshot.get("signature", "")).strip()
+        if not signature:
+            return []
+        return [part.strip() for part in signature.split("|") if part.strip()]
+
+    @classmethod
+    def _state_delta_from_snapshots(
+        cls,
+        before_snapshot: dict[str, Any],
+        after_snapshot: dict[str, Any],
+        workspace_validation: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        before = before_snapshot if isinstance(before_snapshot, dict) else {}
+        after = after_snapshot if isinstance(after_snapshot, dict) else {}
+        before_total = int(before.get("failed_tests", 0) or 0) + int(
+            before.get("test_errors", 0) or 0
+        )
+        after_total = int(after.get("failed_tests", 0) or 0) + int(
+            after.get("test_errors", 0) or 0
+        )
+        changed_files: list[str] = []
+        if isinstance(workspace_validation, dict):
+            raw_changed = workspace_validation.get("changed_files", [])
+            if isinstance(raw_changed, list):
+                changed_files = [str(item).strip() for item in raw_changed if str(item).strip()]
+
+        if bool(after.get("tests_passed", False)):
+            impact = "resolved"
+        elif after_total < before_total:
+            impact = "improved"
+        elif after_total > before_total:
+            impact = "regressed"
+        elif str(after.get("signature", "")) != str(before.get("signature", "")):
+            impact = "changed"
+        else:
+            impact = "unchanged"
+
+        return {
+            "impact": impact,
+            "made_progress": impact in {"resolved", "improved", "changed"},
+            "tests_fixed": max(0, before_total - after_total),
+            "new_errors": max(0, after_total - before_total),
+            "before_total": before_total,
+            "after_total": after_total,
+            "before_signature": str(before.get("signature", "")),
+            "after_signature": str(after.get("signature", "")),
+            "before_items": cls._snapshot_failure_items(before),
+            "after_items": cls._snapshot_failure_items(after),
+            "workspace_changed": bool(changed_files),
+            "changed_files": changed_files,
+        }
+
+    def _resolve_autonomous_action(
+        self,
+        proposed_action: str,
+        proposed_reason: str,
+        model_done: bool,
+        model_bored: bool,
+        validation_status: str,
+        validation_score: float,
+        state_delta: dict[str, Any],
+        step_fingerprint: str,
+        convergence_state: dict[str, Any],
+        auto_metrics: dict[str, Any],
+    ) -> tuple[str, str]:
+        del validation_status
+        del validation_score
+        action = str(proposed_action or "advance").strip().lower()
+        if action not in {"advance", "retry", "replan", "done", "bored"}:
+            action = "advance"
+        reason = str(proposed_reason or "").strip()
+
+        if model_done and action not in {"retry", "replan"}:
+            action = "done"
+        if model_bored and action not in {"retry", "replan"}:
+            action = "bored"
+
+        max_tool_calls = int(getattr(self, "autonomous_max_tool_calls", 0) or 0)
+        if max_tool_calls > 0 and int(auto_metrics.get("tool_calls", 0) or 0) >= max_tool_calls:
+            convergence_state["stop_reason"] = "tool-call budget reached"
+            return "bored", "tool-call budget reached"
+
+        retry_counts = convergence_state.setdefault("step_retry_counts", {})
+        if not isinstance(retry_counts, dict):
+            retry_counts = {}
+            convergence_state["step_retry_counts"] = retry_counts
+
+        made_progress = bool((state_delta or {}).get("made_progress", False))
+        if made_progress:
+            convergence_state["no_progress_streak"] = 0
+            if step_fingerprint:
+                retry_counts.pop(step_fingerprint, None)
+        elif action == "retry":
+            convergence_state["no_progress_streak"] = int(
+                convergence_state.get("no_progress_streak", 0) or 0
+            ) + 1
+        else:
+            convergence_state["no_progress_streak"] = 0
+
+        if action == "retry":
+            current_retry = int(retry_counts.get(step_fingerprint, 0) or 0) + 1
+            retry_counts[step_fingerprint] = current_retry
+            max_retries = int(getattr(self, "autonomous_max_retries_per_step", 0) or 0)
+            if max_retries > 0 and current_retry > max_retries:
+                max_replans = int(getattr(self, "autonomous_max_replans", 0) or 0)
+                replans_used = int(auto_metrics.get("replans", 0) or 0)
+                if max_replans > 0 and replans_used >= max_replans:
+                    convergence_state["stop_reason"] = "replan budget exceeded"
+                    return "bored", "replan budget exceeded after retry budget exceeded"
+                retry_counts[step_fingerprint] = max_retries
+                return "replan", "retry budget exceeded; escalating to replan"
+        max_no_progress = int(getattr(self, "autonomous_max_no_progress_streak", 0) or 0)
+        if (
+            action == "retry"
+            and max_no_progress > 0
+            and int(convergence_state.get("no_progress_streak", 0) or 0) >= max_no_progress
+        ):
+            max_replans = int(getattr(self, "autonomous_max_replans", 0) or 0)
+            replans_used = int(auto_metrics.get("replans", 0) or 0)
+            if max_replans > 0 and replans_used >= max_replans:
+                convergence_state["stop_reason"] = "replan budget exceeded"
+                return "bored", "replan budget exceeded after no-progress streak"
+            return "replan", "no-progress streak reached; escalating to replan"
+        elif action in {"advance", "done", "replan"} and step_fingerprint:
+            retry_counts.pop(step_fingerprint, None)
+
+        if action == "replan":
+            convergence_state["no_progress_streak"] = 0
+
+        return action, reason
+
+    def _preserve_completed_step_ids(
+        self,
+        previous_steps: list[PlanStep],
+        previous_completed_ids: set[int],
+        new_steps: list[PlanStep],
+    ) -> set[int]:
+        previous_fingerprints = {
+            self._plan_step_fingerprint(step)
+            for step in previous_steps
+            if step.step_id in previous_completed_ids
+        }
+        preserved: set[int] = set()
+        for step in new_steps:
+            if self._plan_step_fingerprint(step) in previous_fingerprints:
+                preserved.add(step.step_id)
+        return preserved
 
     def _collect_validation_signals(
         self,
@@ -3714,7 +4196,6 @@ class ChatEngine:
             "edit_file",
             "write_file",
             "delete_file",
-            "execute_command",
         }
         tool_names = set(self._tool_names_from_payloads(payloads))
         action = step.action.lower()
@@ -3997,7 +4478,14 @@ class ChatEngine:
             return False, [], workspace_validation, None
         selected = matches[0]
         match_score = float(selected.get("score", 0.0) or 0.0)
+        print(
+            "[auto] root-cause candidate: "
+            f"pattern={str(selected.get('pattern', '')).strip()!r}, "
+            f"match_score={match_score:.2f}, "
+            f"confidence={float(selected.get('confidence', 0.0) or 0.0):.2f}"
+        )
         if match_score < 0.75:
+            print("[auto] root-cause skipped: low match score")
             history_item = {
                 "attempt": 0,
                 "kind": "root_cause",
@@ -4018,6 +4506,7 @@ class ChatEngine:
 
         root_payloads: list[dict[str, Any]] = []
         all_ok = True
+        print("[auto] applying known fix template...")
         for item in fix_template:
             if not isinstance(item, dict):
                 continue
@@ -4045,6 +4534,8 @@ class ChatEngine:
         signals = self._workspace_validation_signals(updated_validation)
         solved = bool(signals.get("tests_passed", False))
         confidence = float(selected.get("confidence", 0.5) or 0.5)
+        if solved:
+            print("[auto] known root-cause fix solved failing tests")
         if hasattr(store, "record_root_cause_feedback"):
             try:
                 store.record_root_cause_feedback(
@@ -4114,7 +4605,7 @@ class ChatEngine:
             return
         context = self._build_root_cause_context(step=step, project_context=project_context)
         try:
-            store.upsert_root_cause(
+            result = store.upsert_root_cause(
                 pattern=pattern,
                 context=context,
                 fix_template=successful_tools,
@@ -4122,6 +4613,13 @@ class ChatEngine:
                 confidence=max(0.0, min(float(confidence), 1.0)),
                 source="autonomous_repair",
             )
+            if isinstance(result, dict) and result.get("ok", False):
+                print(
+                    "[auto] recording root cause: "
+                    f"pattern={pattern!r}, "
+                    f"confidence={max(0.0, min(float(confidence), 1.0)):.2f}, "
+                    f"fix_calls={len(successful_tools)}"
+                )
         except Exception:
             pass
 
@@ -4345,6 +4843,10 @@ class ChatEngine:
                 repair_history=repair_history,
             )
             print(f"[auto] test-driven repair attempt {attempt_no + 1}")
+            print(
+                "[auto] hypothesis: "
+                f"{str(hypothesis.get('hypothesis', '')).strip() or 'Investigate current failing path'}"
+            )
             renderer = StreamRenderer()
             response = self.handle_turn_stream(
                 repair_prompt,
@@ -4505,7 +5007,7 @@ class ChatEngine:
         step: PlanStep,
         payloads: list[dict[str, Any]],
         validation: dict[str, Any],
-        learned_signatures: set[str],
+        learned_signatures: OrderedDict[str, None],
     ) -> dict[str, Any] | None:
         if not self.autonomous_skill_learning_enabled:
             return None
@@ -4533,9 +5035,8 @@ class ChatEngine:
             f"{c['tool']}:{json.dumps(c.get('args', {}), sort_keys=True, ensure_ascii=False)}"
             for c in tool_calls
         )
-        if signature in learned_signatures:
+        if not self._remember_learned_signature(learned_signatures, signature):
             return None
-        learned_signatures.add(signature)
 
         action_slug = re.sub(r"[^a-z0-9_]+", "_", step.action.lower()).strip("_")
         if not action_slug:

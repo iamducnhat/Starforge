@@ -3,6 +3,9 @@ import unittest
 from pathlib import Path
 
 from assistant.functions_registry import FunctionRegistry
+from assistant.memory import MemoryStore
+from assistant.tools import ToolSystem
+from assistant.workspace_tools import WorkspaceTools
 
 
 class TestSkillRegistry(unittest.TestCase):
@@ -10,6 +13,9 @@ class TestSkillRegistry(unittest.TestCase):
         self.root = Path("test_skills_registry")
         self.root.mkdir(parents=True, exist_ok=True)
         self.registry = FunctionRegistry(self.root)
+        self.memory = MemoryStore(self.root / "memory")
+        self.workspace_tools = WorkspaceTools(self.root)
+        self.tool_system = ToolSystem(self.memory, self.registry, self.workspace_tools)
 
     def tearDown(self):
         if self.root.exists():
@@ -45,6 +51,49 @@ class TestSkillRegistry(unittest.TestCase):
         skill = outcome["skill"]
         self.assertEqual(skill["success_count"], 1)
         self.assertGreater(skill["confidence_sum"], 0.0)
+
+    def test_create_skill_persists_extended_metadata(self):
+        created = self.registry.create_skill(
+            name="Auto Fix Auth",
+            description="Auto-learned auth repair workflow",
+            keywords=["auth", "repair"],
+            tool_calls=[{"tool": "run_tests", "args": {"path": "."}}],
+            skill="fix_auth",
+            inputs=["file_path", "test_runner"],
+            steps_template=[{"tool": "edit_file", "args": {"path": "${file_path}"}}],
+            match_conditions=["auth", "pytest"],
+        )
+        self.assertTrue(created["ok"])
+        skill = created["skill"]
+        self.assertEqual(skill["skill"], "fix_auth")
+        self.assertEqual(skill["inputs"], ["file_path", "test_runner"])
+        self.assertEqual(
+            skill["steps_template"],
+            [{"tool": "edit_file", "args": {"path": "${file_path}"}}],
+        )
+        self.assertEqual(skill["match_conditions"], ["auth", "pytest"])
+
+    def test_tool_system_create_skill_accepts_extended_args(self):
+        created = self.tool_system.execute(
+            "create_skill",
+            {
+                "name": "Auto Fix Demo",
+                "description": "Autonomous repair workflow",
+                "keywords": ["demo", "repair"],
+                "tool_calls": [{"tool": "run_tests", "args": {"path": "."}}],
+                "skill": "fix_demo",
+                "inputs": ["file_path"],
+                "steps_template": [
+                    {"tool": "edit_file", "args": {"path": "${file_path}"}}
+                ],
+                "match_conditions": ["demo", "pytest"],
+            },
+        )
+        self.assertTrue(created["ok"])
+        skill = created["skill"]
+        self.assertEqual(skill["skill"], "fix_demo")
+        self.assertEqual(skill["inputs"], ["file_path"])
+        self.assertEqual(skill["match_conditions"], ["demo", "pytest"])
 
 
 if __name__ == "__main__":

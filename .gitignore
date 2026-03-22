@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
 
 # macOS
 .DS_Store
@@ -15,7 +16,6 @@ __pycache__/
 # Runtime/generated memory & logs
 memory/
 workspaces/
-memory/sessions/
 finetune/
 functions/
 

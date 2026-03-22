@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import os
-import queue
 import re
 import shutil
 import subprocess
 import threading
 import time
+import unicodedata
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,17 @@ class WorkspaceTools:
         self.workspace_root = Path(workspace_root).resolve()
         self.plans_dir = self.workspace_root / "memory" / "plans"
         self._terminals: dict[str, dict[str, Any]] = {}
+        self._terminal_buffer_lines = max(
+            100, min(int(os.getenv("ASSISTANT_TERMINAL_BUFFER_LINES", "2000")), 20000)
+        )
+        self._terminal_line_max_chars = max(
+            256,
+            min(int(os.getenv("ASSISTANT_TERMINAL_LINE_MAX_CHARS", "4096")), 65536),
+        )
+        self._terminal_idle_timeout_s = max(
+            60,
+            min(int(os.getenv("ASSISTANT_TERMINAL_IDLE_TIMEOUT", "1800")), 86400),
+        )
         ensure_dir(self.plans_dir)
 
     def _resolve(self, path: str) -> Path:
@@ -48,6 +60,49 @@ class WorkspaceTools:
             return str(path.relative_to(self.workspace_root))
         except Exception:
             return str(path)
+
+    def _close_terminal_session(
+        self, session_id: str, session: dict[str, Any], *, kill: bool = False
+    ) -> None:
+        proc = session.get("proc")
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    if kill:
+                        proc.kill()
+                    else:
+                        proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=1)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._terminals.pop(session_id, None)
+
+    def close_idle_terminals(self, max_idle_s: int | None = None) -> int:
+        idle_limit = (
+            self._terminal_idle_timeout_s
+            if max_idle_s is None
+            else max(1, int(max_idle_s))
+        )
+        now = time.time()
+        closed = 0
+        for session_id, session in list(self._terminals.items()):
+            proc = session.get("proc")
+            last_used = float(session.get("last_used_at", now) or now)
+            idle_for = max(0.0, now - last_used)
+            should_close = idle_for >= idle_limit
+            if proc is not None and proc.poll() is not None:
+                should_close = True
+            if not should_close:
+                continue
+            self._close_terminal_session(session_id, session, kill=idle_for >= idle_limit)
+            closed += 1
+        return closed
 
     def list_files(
         self,
@@ -238,6 +293,8 @@ class WorkspaceTools:
                 "error": f"invalid action '{action}', must be one of {actions}",
             }
 
+        self.close_idle_terminals()
+
         if action == "start":
             if session_id in self._terminals:
                 return {"ok": False, "error": f"Session {session_id} already exists."}
@@ -255,25 +312,40 @@ class WorkspaceTools:
             except Exception as e:
                 return {"ok": False, "error": f"failed to start session: {e}"}
 
-            out_queue = queue.Queue()
+            output_buffer: deque[str] = deque(maxlen=self._terminal_buffer_lines)
+            buffer_lock = threading.Lock()
+            buffer_stats = {"dropped_lines": 0}
 
-            def reader(pipe, q):
+            def reader(pipe, buffer_ref, buffer_lock_ref, buffer_stats_ref):
                 try:
                     for line in iter(pipe.readline, ""):
-                        q.put(line)
+                        clipped = (
+                            line[-self._terminal_line_max_chars :]
+                            if len(line) > self._terminal_line_max_chars
+                            else line
+                        )
+                        with buffer_lock_ref:
+                            if len(buffer_ref) >= self._terminal_buffer_lines:
+                                buffer_stats_ref["dropped_lines"] += 1
+                            buffer_ref.append(clipped)
                 except Exception:
                     pass
                 finally:
                     pipe.close()
 
             t = threading.Thread(
-                target=reader, args=(proc.stdout, out_queue), daemon=True
+                target=reader,
+                args=(proc.stdout, output_buffer, buffer_lock, buffer_stats),
+                daemon=True,
             )
             t.start()
             self._terminals[session_id] = {
                 "proc": proc,
-                "queue": out_queue,
+                "buffer": output_buffer,
+                "buffer_stats": buffer_stats,
+                "lock": buffer_lock,
                 "thread": t,
+                "last_used_at": time.time(),
             }
             return {
                 "ok": True,
@@ -294,6 +366,7 @@ class WorkspaceTools:
                     cmd += "\n"
                 s["proc"].stdin.write(cmd)
                 s["proc"].stdin.flush()
+                s["last_used_at"] = time.time()
                 return {
                     "ok": True,
                     "session_id": session_id,
@@ -305,19 +378,33 @@ class WorkspaceTools:
         if action == "read":
             lines = []
             time.sleep(0.1)  # Brief wait for fast outputs
-            while not s["queue"].empty():
-                lines.append(s["queue"].get_nowait())
+            buffer_lock = s.get("lock")
+            buffer_ref = s.get("buffer")
+            if isinstance(buffer_ref, deque) and buffer_lock is not None:
+                with buffer_lock:
+                    lines = list(buffer_ref)
+                    buffer_ref.clear()
+            s["last_used_at"] = time.time()
             output = "".join(lines)
+            stats = s.get("buffer_stats", {})
+            dropped_lines = (
+                int(stats.get("dropped_lines", 0) or 0)
+                if isinstance(stats, dict)
+                else 0
+            )
+            if isinstance(stats, dict):
+                stats["dropped_lines"] = 0
             return {
                 "ok": True,
                 "session_id": session_id,
                 "output": output if output else "[No new output]",
+                "truncated": dropped_lines > 0,
+                "dropped_lines": dropped_lines,
             }
 
         if action == "close":
             try:
-                s["proc"].terminate()
-                del self._terminals[session_id]
+                self._close_terminal_session(session_id, s)
                 return {
                     "ok": True,
                     "session_id": session_id,
@@ -347,6 +434,33 @@ class WorkspaceTools:
         result["hint"] = "write_file is deprecated; prefer create_file/edit_file."
         return result
 
+    @staticmethod
+    def _normalize_edit_match_line(text: str) -> str:
+        if not isinstance(text, str):
+            return ""
+        normalized = unicodedata.normalize("NFKC", text)
+        normalized = (
+            normalized.replace("\u00a0", " ")
+            .replace("\u2010", "-")
+            .replace("\u2011", "-")
+            .replace("\u2012", "-")
+            .replace("\u2013", "-")
+            .replace("\u2014", "-")
+            .replace("\u2212", "-")
+        )
+        normalized = re.sub(r"\s+", " ", normalized)
+        return normalized.strip()
+
+    @staticmethod
+    def _split_line_ending(line: str) -> tuple[str, str]:
+        if line.endswith("\r\n"):
+            return line[:-2], "\r\n"
+        if line.endswith("\n"):
+            return line[:-1], "\n"
+        if line.endswith("\r"):
+            return line[:-1], "\r"
+        return line, ""
+
     def edit_file(
         self,
         path: str,
@@ -366,14 +480,72 @@ class WorkspaceTools:
             }
 
         original = file_path.read_text(encoding="utf-8", errors="replace")
-        if find_text not in original:
-            return {"ok": False, "error": "find_text not found"}
+        find_text_clean = find_text.rstrip("\r\n")
+        if find_text in original:
+            matched_text = find_text
+        elif find_text_clean and find_text_clean in original:
+            matched_text = find_text_clean
+        else:
+            matched_text = None
+
+        if matched_text is None:
+            # Fallback for single-line edits when model output drifts in whitespace
+            # or Unicode punctuation (e.g., non-breaking spaces, en-dash vs hyphen).
+            if "\n" not in find_text_clean and "\r" not in find_text_clean:
+                target = self._normalize_edit_match_line(find_text_clean)
+                if target:
+                    lines = original.splitlines(keepends=True)
+                    hit_indexes: list[int] = []
+                    for idx, raw_line in enumerate(lines):
+                        body, _ = self._split_line_ending(raw_line)
+                        if self._normalize_edit_match_line(body) == target:
+                            hit_indexes.append(idx)
+
+                    if hit_indexes:
+                        if replace_all:
+                            for idx in hit_indexes:
+                                body, line_ending = self._split_line_ending(lines[idx])
+                                leading = re.match(r"[ \t]*", body)
+                                indent = leading.group(0) if leading else ""
+                                replacement = (
+                                    replace_text
+                                    if replace_text.startswith((" ", "\t"))
+                                    else f"{indent}{replace_text.lstrip()}"
+                                )
+                                lines[idx] = f"{replacement}{line_ending}"
+                            replacements = len(hit_indexes)
+                        else:
+                            idx = hit_indexes[0]
+                            body, line_ending = self._split_line_ending(lines[idx])
+                            leading = re.match(r"[ \t]*", body)
+                            indent = leading.group(0) if leading else ""
+                            replacement = (
+                                replace_text
+                                if replace_text.startswith((" ", "\t"))
+                                else f"{indent}{replace_text.lstrip()}"
+                            )
+                            lines[idx] = f"{replacement}{line_ending}"
+                            replacements = 1
+
+                        write_text(file_path, "".join(lines))
+                        return {
+                            "ok": True,
+                            "path": self._to_workspace_rel(file_path),
+                            "replacements": replacements,
+                            "match_mode": "normalized_line",
+                        }
+
+            return {
+                "ok": False,
+                "error": "find_text not found",
+                "hint": "Exact match failed. Re-read the file and copy the snippet exactly, or use a shorter unique find_text.",
+            }
 
         if replace_all:
-            updated = original.replace(find_text, replace_text)
-            replacements = original.count(find_text)
+            updated = original.replace(matched_text, replace_text)
+            replacements = original.count(matched_text)
         else:
-            updated = original.replace(find_text, replace_text, 1)
+            updated = original.replace(matched_text, replace_text, 1)
             replacements = 1
 
         write_text(file_path, updated)
@@ -405,14 +577,18 @@ class WorkspaceTools:
         rel_base = self._to_workspace_rel(base)
 
         if shutil.which("rg"):
+            per_file_limit = max(1, min(limit, 20))
             cmd = [
                 "rg",
                 "--json",
                 "--line-number",
                 "--color",
                 "never",
+                "--no-messages",
                 "--max-count",
-                str(limit),
+                str(per_file_limit),
+                "--max-filesize",
+                "1M",
             ]
             if not case_sensitive:
                 cmd.append("-i")
@@ -422,32 +598,68 @@ class WorkspaceTools:
                 cmd.extend(["-g", glob])
             cmd.extend([q, str(base)])
             try:
-                proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
                 matches: list[dict[str, Any]] = []
-                for line in proc.stdout.splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
+                if proc.stdout is not None:
+                    for raw in proc.stdout:
+                        line = raw.strip()
+                        if not line:
+                            continue
+                        try:
+                            item = json.loads(line)
+                        except Exception:
+                            continue
+                        if item.get("type") != "match":
+                            continue
+                        data = item.get("data", {})
+                        path_text = str(data.get("path", {}).get("text", "")).strip()
+                        line_num = int(data.get("line_number", 0) or 0)
+                        text_data = data.get("lines", {}).get("text", "")
+                        text_val = str(text_data).rstrip("\n")
+                        if not path_text:
+                            continue
+                        try:
+                            rel = self._to_workspace_rel(Path(path_text))
+                        except Exception:
+                            rel = path_text
+                        matches.append({"path": rel, "line": line_num, "text": text_val})
+                        if len(matches) >= limit:
+                            proc.terminate()
+                            break
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
                     try:
-                        item = json.loads(line)
+                        proc.kill()
                     except Exception:
-                        continue
-                    if item.get("type") != "match":
-                        continue
-                    data = item.get("data", {})
-                    path_text = str(data.get("path", {}).get("text", "")).strip()
-                    line_num = int(data.get("line_number", 0) or 0)
-                    text_data = data.get("lines", {}).get("text", "")
-                    text_val = str(text_data).rstrip("\n")
-                    if not path_text:
-                        continue
+                        pass
                     try:
-                        rel = self._to_workspace_rel(Path(path_text))
+                        proc.wait(timeout=1)
                     except Exception:
-                        rel = path_text
-                    matches.append({"path": rel, "line": line_num, "text": text_val})
-                    if len(matches) >= limit:
-                        break
+                        pass
+
+                if proc.returncode not in (0, 1, None):
+                    err_excerpt = ""
+                    if proc.stderr is not None:
+                        try:
+                            err_excerpt = (proc.stderr.read() or "")[:600]
+                        except Exception:
+                            err_excerpt = ""
+                    return {
+                        "ok": False,
+                        "engine": "rg",
+                        "query": q,
+                        "path": rel_base,
+                        "error": f"rg failed with exit code {proc.returncode}",
+                        "stderr": err_excerpt,
+                    }
+
                 return {
                     "ok": True,
                     "engine": "rg",
@@ -463,10 +675,16 @@ class WorkspaceTools:
         flags = 0 if case_sensitive else re.IGNORECASE
         pattern = re.compile(q, flags=flags) if regex else None
         matches: list[dict[str, Any]] = []
+        max_fallback_file_bytes = 1_000_000
         for p in base.glob(glob.strip() or "**/*"):
             if len(matches) >= limit:
                 break
             if not p.is_file():
+                continue
+            try:
+                if p.stat().st_size > max_fallback_file_bytes:
+                    continue
+            except Exception:
                 continue
             try:
                 raw = p.read_text(encoding="utf-8", errors="replace")
@@ -918,7 +1136,10 @@ class WorkspaceTools:
         started = time.time()
         try:
             proc = subprocess.run(
-                ["/bin/bash", "-lc", cmd],
+                # Use non-login shell for deterministic behavior inside the workspace.
+                # Login shells may source user profiles and introduce aliases/path hacks
+                # that make autonomous runs operate on unexpected locations.
+                ["/bin/bash", "-c", cmd],
                 cwd=str(base),
                 capture_output=True,
                 text=True,
@@ -1248,13 +1469,21 @@ class WorkspaceTools:
     def get_plan(self, plan_id: str) -> dict[str, Any]:
         plan = self._load_plan(plan_id)
         if not plan:
-            return {"ok": False, "error": f"plan not found: {plan_id}"}
+            return {
+                "ok": False,
+                "error": f"plan not found: {plan_id}",
+                "hint": "Call create_plan first, or list_plans to get a valid plan_id.",
+            }
         return {"ok": True, "plan": plan}
 
     def add_todo(self, plan_id: str, text: str) -> dict[str, Any]:
         plan = self._load_plan(plan_id)
         if not plan:
-            return {"ok": False, "error": f"plan not found: {plan_id}"}
+            return {
+                "ok": False,
+                "error": f"plan not found: {plan_id}",
+                "hint": "Call create_plan first, then add_todo using the returned plan_id.",
+            }
 
         todos = plan.get("todos", [])
         if not isinstance(todos, list):
@@ -1279,7 +1508,11 @@ class WorkspaceTools:
     def update_todo(self, plan_id: str, todo_id: int, status: str) -> dict[str, Any]:
         plan = self._load_plan(plan_id)
         if not plan:
-            return {"ok": False, "error": f"plan not found: {plan_id}"}
+            return {
+                "ok": False,
+                "error": f"plan not found: {plan_id}",
+                "hint": "Call create_plan first, then update_todo using the returned plan_id.",
+            }
 
         valid = {"pending", "in_progress", "done"}
         if status not in valid:

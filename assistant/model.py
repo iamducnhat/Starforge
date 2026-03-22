@@ -6,6 +6,7 @@ import re
 import socket
 import subprocess
 import time
+from collections import OrderedDict
 from collections.abc import Iterator
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -16,18 +17,27 @@ from .utils import get_env_float as _env_float
 from .utils import get_env_int as _env_int
 
 # Fix for macOS DNS resolution issue - use nslookup as fallback
-_dns_cache: dict[str, str] = {}
+_dns_cache: OrderedDict[str, str] = OrderedDict()
+_dns_cache_max_entries = max(32, min(_env_int("ASSISTANT_DNS_CACHE_SIZE", 256), 4096))
+
+
+def _remember_dns(hostname: str, ip: str) -> None:
+    _dns_cache[hostname] = ip
+    _dns_cache.move_to_end(hostname)
+    while len(_dns_cache) > _dns_cache_max_entries:
+        _dns_cache.popitem(last=False)
 
 
 def _resolve_hostname(hostname: str) -> str:
     """Resolve hostname with fallback to nslookup."""
     if hostname in _dns_cache:
+        _dns_cache.move_to_end(hostname)
         return _dns_cache[hostname]
 
     # Try standard resolution first
     try:
         ip = socket.gethostbyname(hostname)
-        _dns_cache[hostname] = ip
+        _remember_dns(hostname, ip)
         return ip
     except socket.gaierror:
         pass
@@ -43,7 +53,7 @@ def _resolve_hostname(hostname: str) -> str:
                 if parts:
                     ip = parts[-1]
                     if "." in ip and all(p.isdigit() for p in ip.split(".")):
-                        _dns_cache[hostname] = ip
+                        _remember_dns(hostname, ip)
                         return ip
     except Exception:
         pass
@@ -71,6 +81,12 @@ def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
 
 
 socket.getaddrinfo = _patched_getaddrinfo
+
+
+def clear_dns_cache() -> int:
+    before = len(_dns_cache)
+    _dns_cache.clear()
+    return before
 
 
 def _message_content_to_text(content: Any) -> str:

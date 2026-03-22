@@ -173,6 +173,11 @@ def parse_args() -> argparse.Namespace:
         help="Max autonomous steps per objective (>0 finite, 0 infinite)",
     )
     parser.add_argument(
+        "--autonomous-objective",
+        default="",
+        help="Run one autonomous objective and exit (non-interactive)",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -234,6 +239,15 @@ def main() -> None:
         from assistant.server import start_server
 
         start_server(engine, host=args.host, port=args.port)
+        return
+
+    if args.autonomous_objective.strip():
+        objective = args.autonomous_objective.strip()
+        steps = args.autonomous_steps
+        if steps <= 0:
+            # Keep one-shot runs bounded for demos unless explicitly set.
+            steps = 8
+        engine.run_autonomous(objective, steps)
         return
 
     if args.once:

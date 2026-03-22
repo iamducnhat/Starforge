@@ -116,7 +116,14 @@ class ToolSystem:
             if "max_results" not in normalized and "limit" in normalized:
                 normalized["max_results"] = normalized.get("limit")
 
-            allowed = {"query", "max_results", "fetch_top_pages", "page_timeout", "level"}
+            allowed = {
+                "query",
+                "max_results",
+                "fetch_top_pages",
+                "page_timeout",
+                "level",
+                "persist",
+            }
             normalized = {
                 k: v for k, v in normalized.items() if k in allowed and v is not None
             }
@@ -531,6 +538,7 @@ class ToolSystem:
         fetch_top_pages: int | None = None,
         page_timeout: int | None = None,
         level: str = "auto",
+        persist: bool = False,
     ) -> dict[str, Any]:
         search = search_web(
             query,
@@ -543,7 +551,7 @@ class ToolSystem:
         meta = search.get("meta", {}) if isinstance(search, dict) else {}
         saved_block: dict[str, Any] | None = None
 
-        if results:
+        if results and persist:
             sources = [
                 str(item.get("url", "")).strip()
                 for item in results
@@ -574,7 +582,12 @@ class ToolSystem:
                 "saved_block": saved_block,
             }
 
-        return {"ok": True, "search": search, "saved_block": saved_block}
+        return {
+            "ok": True,
+            "search": search,
+            "saved_block": saved_block,
+            "persisted": bool(results and persist and isinstance(saved_block, dict) and saved_block.get("ok", False)),
+        }
 
     def extract_code_snippets(self, html: str) -> dict[str, Any]:
         return {"ok": True, "snippets": extract_code_snippets(html)}
