@@ -644,6 +644,17 @@ class WorkspaceTools:
                     except Exception:
                         pass
 
+                if proc.returncode == -15 and matches:
+                    return {
+                        "ok": True,
+                        "engine": "rg",
+                        "query": q,
+                        "path": rel_base,
+                        "count": len(matches),
+                        "matches": matches,
+                        "truncated": len(matches) >= limit,
+                    }
+
                 if proc.returncode not in (0, 1, None):
                     err_excerpt = ""
                     if proc.stderr is not None:

@@ -3,7 +3,15 @@ import unittest
 from pathlib import Path
 import shutil
 
-from assistant.chat_engine import ChatEngine, PlanStep, TaskState
+import assistant.chat_engine as chat_engine_module
+from assistant.chat_engine import (
+    ChatEngine,
+    PlanStep,
+    ResolutionContext,
+    TaskState,
+    compute_confidence,
+    resolution_succeeded,
+)
 from assistant.functions_registry import FunctionRegistry
 from assistant.memory import MemoryStore
 from assistant.tools import ToolSystem
@@ -26,6 +34,19 @@ class _DummyTools:
         self.memory_store = memory_store
 
 
+class _TimeoutCaptureModel:
+    def __init__(self):
+        self.timeout = 120
+        self.seen_timeout = None
+
+    def generate(self, messages):
+        self.seen_timeout = self.timeout
+        return '{"steps":[]}'
+
+    def stream_generate(self, messages):  # pragma: no cover - not used here
+        yield '{"steps":[]}'
+
+
 class _AutoTools:
     def __init__(self, memory_store=None):
         self.memory_store = memory_store
@@ -39,6 +60,7 @@ class _AutoTools:
 class _CaptureTools:
     def __init__(self):
         self.calls = []
+        self.memory_store = None
 
     def execute(self, name, args):
         self.calls.append((name, args))
@@ -51,7 +73,33 @@ class _ImmediateFixTools:
         self.memory_store = None
 
     def execute(self, name, args):
-        self.calls.append((name, args))
+        self.calls.append((name, dict(args)))
+        if name == "search_project":
+            query = str(args.get("query", ""))
+            if query == "def add(":
+                return {
+                    "ok": True,
+                    "count": 1,
+                    "matches": [
+                        {
+                            "path": "demo_project/utils.py",
+                            "line": 1,
+                            "text": "def add(a: int, b: int) -> int:",
+                        }
+                    ],
+                }
+            return {"ok": True, "count": 0, "matches": []}
+        if name == "read_file":
+            path = str(args.get("path", ""))
+            if path == "demo_project/utils.py":
+                return {
+                    "ok": True,
+                    "path": path,
+                    "start_line": args.get("start_line", 1),
+                    "end_line": args.get("end_line", 21),
+                    "content": "def add(a: int, b: int) -> int:\n    return a - b  # BUG\n",
+                }
+            return {"ok": False, "error": f"unexpected path: {path}"}
         if name == "edit_file":
             return {"ok": True, "path": args.get("path", ""), "replacements": 1}
         if name == "validate_workspace_changes":
@@ -75,6 +123,8 @@ class _StubLearningStore:
     def __init__(self, matches=None):
         self.matches = matches or []
         self.upserts = []
+        self.repair_pattern_matches = []
+        self.repair_patterns = []
 
     def find_root_causes(self, error_text, context, limit=1):
         return list(self.matches)[: max(1, int(limit))]
@@ -83,8 +133,44 @@ class _StubLearningStore:
         self.upserts.append(dict(kwargs))
         return {"ok": True, "created": True, "entry": kwargs}
 
+    def find_repair_patterns(self, pattern, before="", context="", limit=1):
+        del pattern, before, context
+        return list(self.repair_pattern_matches)[: max(1, int(limit))]
+
+    def match_repair_pattern(self, failure_signature, limit=1):
+        del failure_signature
+        return list(self.repair_pattern_matches)[: max(1, int(limit))]
+
+    def record_repair_pattern(self, **kwargs):
+        self.repair_patterns.append(dict(kwargs))
+        return {"ok": True, "created": True, "entry": kwargs}
+
 
 class TestStructuredPlanner(unittest.TestCase):
+    def test_resolution_succeeded_accepts_non_test_signals(self):
+        self.assertTrue(
+            resolution_succeeded(
+                ResolutionContext(build_passed=True, command_exit_code=0)
+            )
+        )
+        self.assertTrue(
+            resolution_succeeded(
+                ResolutionContext(output_valid=True)
+            )
+        )
+        self.assertFalse(resolution_succeeded(ResolutionContext(command_exit_code=1)))
+
+    def test_compute_confidence_requires_strong_signal_for_learning(self):
+        self.assertLess(compute_confidence(ResolutionContext(command_exit_code=0)), 0.8)
+        self.assertGreaterEqual(
+            compute_confidence(ResolutionContext(output_valid=True)),
+            0.8,
+        )
+        self.assertGreaterEqual(
+            compute_confidence(ResolutionContext(tests_passed=True)),
+            0.8,
+        )
+
     def test_autonomous_blocks_todo_plan_tools(self):
         tools = _CaptureTools()
         engine = ChatEngine(
@@ -387,6 +473,50 @@ class TestStructuredPlanner(unittest.TestCase):
         self.assertTrue(second.get("cached"))
         self.assertEqual(tools.calls, [("read_file", {"path": "README.md"})])
 
+    def test_autonomous_read_file_is_windowed_after_search_hit(self):
+        class _SearchAwareTools:
+            def __init__(self):
+                self.calls = []
+                self.memory_store = None
+
+            def execute(self, name, args):
+                self.calls.append((name, dict(args)))
+                if name == "search_project":
+                    return {
+                        "ok": True,
+                        "count": 1,
+                        "matches": [{"path": "demo_project/utils.py", "line": 40, "text": "def add("}],
+                    }
+                if name == "read_file":
+                    return {"ok": True, "path": args.get("path", ""), "content": "snippet"}
+                return {"ok": True}
+
+        tools = _SearchAwareTools()
+        engine = ChatEngine(model=_DummyModel(), tools=tools, system_prompt="test")
+        engine._autonomous_execution_active = True
+
+        engine._execute_tool_call_with_policy(
+            "auto run",
+            {"name": "search_project", "args": {"query": "def add(", "path": "."}},
+        )
+        engine._execute_tool_call_with_policy(
+            "auto run",
+            {"name": "read_file", "args": {"path": "demo_project/utils.py"}},
+        )
+
+        self.assertEqual(
+            tools.calls[-1],
+            (
+                "read_file",
+                {
+                    "path": "demo_project/utils.py",
+                    "start_line": 20,
+                    "end_line": 60,
+                    "max_chars": 4000,
+                },
+            ),
+        )
+
     def test_retry_skips_duplicate_failing_execute_command(self):
         engine = ChatEngine(
             model=_DummyModel(),
@@ -445,6 +575,272 @@ class TestStructuredPlanner(unittest.TestCase):
         self.assertTrue(signals["workspace_validation_completed"])
         self.assertIn("assertion_failures", signals["failure_modes"])
 
+    def test_infer_validation_test_args_prefers_recent_pytest_scope(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        inferred = engine._infer_validation_test_args(
+            "fix failing tests in demo_project only",
+            [
+                {
+                    "tool": "execute_command",
+                    "args": {"cmd": "pytest -q demo_project/tests"},
+                    "result": {"ok": False, "exit_code": 1},
+                }
+            ],
+        )
+        self.assertEqual(inferred, "demo_project/tests")
+
+    def test_infer_search_root_from_test_scope(self):
+        self.assertEqual(
+            ChatEngine._infer_search_root_from_test_scope("demo_project/tests"),
+            "demo_project",
+        )
+        self.assertEqual(
+            ChatEngine._infer_search_root_from_test_scope("demo_project/tests/test_main.py::test_add"),
+            "demo_project/tests",
+        )
+
+    def test_build_autonomous_step_contract_for_single_target_failure(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        contract = engine._build_autonomous_step_contract(
+            objective="Fix failing tests in demo_project only. Run pytest -q demo_project/tests.",
+            step=PlanStep(step_id=1, action="run_tests"),
+            workspace_validation={
+                "validation_signals": {
+                    "tests_passed": False,
+                    "failed_tests": 1,
+                    "test_errors": 0,
+                    "test_failures": [
+                        {
+                            "nodeid": "demo_project/tests/test_main.py::test_add",
+                            "summary": "FAILED demo_project/tests/test_main.py::test_add - assert -1 == 5",
+                        }
+                    ],
+                }
+            },
+            tool_payloads=[],
+        )
+        self.assertEqual(contract["mode"], "single_target_test_debug")
+        self.assertEqual(contract["tool_budget"], 4)
+        self.assertEqual(contract["analysis_budget"], 1)
+
+    def test_generate_model_text_restores_timeout_after_bounded_call(self):
+        model = _TimeoutCaptureModel()
+        engine = ChatEngine(model=model, tools=_DummyTools(), system_prompt="test")
+        text = engine._generate_model_text(
+            [{"role": "user", "content": "plan"}],
+            timeout=9,
+        )
+        self.assertEqual(text, '{"steps":[]}')
+        self.assertEqual(model.seen_timeout, 9)
+        self.assertEqual(model.timeout, 120)
+
+    def test_execution_contract_violation_detects_unpatched_trivial_loop(self):
+        violation = ChatEngine._execution_contract_violation_reason(
+            {
+                "mode": "single_target_test_debug",
+                "tool_budget": 4,
+                "require_search_before_read": True,
+            },
+            {
+                "total": 5,
+                "search_count": 1,
+                "read_count": 2,
+                "edit_count": 0,
+                "duplicate_reads": 1,
+                "tests_green": False,
+            },
+        )
+        self.assertIn("re-read the same file", violation)
+
+    def test_summarize_tool_activity_tracks_real_repeated_reads(self):
+        summary = ChatEngine._summarize_tool_activity(
+            [
+                {
+                    "tool": "lookup_symbol",
+                    "args": {"symbol": "add", "path": "demo_project"},
+                    "result": {"ok": True, "duplicate_call": True},
+                },
+                {
+                    "tool": "read_file",
+                    "args": {"path": "demo_project/utils.py"},
+                    "result": {"ok": True, "duplicate_call": True},
+                },
+                {
+                    "tool": "edit_file",
+                    "args": {"path": "demo_project/utils.py"},
+                    "result": {"ok": True},
+                },
+            ],
+            workspace_validation={"tests_passed": True},
+        )
+        self.assertEqual(summary["duplicate_reads"], 0)
+        self.assertEqual(summary["duplicate_calls"], 0)
+        self.assertEqual(summary["validation_count"], 1)
+        self.assertTrue(summary["tests_green"])
+
+    def test_objective_tests_green_uses_targeted_pytest_command(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        self.assertTrue(
+            engine._objective_tests_green(
+                objective="Fix failing tests in demo_project only. Run pytest -q demo_project/tests.",
+                tool_payloads=[
+                    {
+                        "tool": "execute_command",
+                        "args": {"cmd": "pytest -q demo_project/tests"},
+                        "result": {"ok": True, "exit_code": 0},
+                    }
+                ],
+                workspace_validation=None,
+            )
+        )
+
+    def test_objective_tests_green_rejects_unrepaired_failed_edit(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        self.assertFalse(
+            engine._objective_tests_green(
+                objective="Fix failing tests in demo_project only. Run pytest -q demo_project/tests.",
+                tool_payloads=[
+                    {
+                        "tool": "edit_file",
+                        "args": {"path": "demo_project/utils.py"},
+                        "result": {"ok": False, "error": "find_text not found"},
+                    }
+                ],
+                workspace_validation={
+                    "ok": True,
+                    "tests_passed": True,
+                    "tests": {"command": "pytest -q demo_project/tests"},
+                    "validation_signals": {
+                        "validation_completed": True,
+                        "tests_passed": True,
+                        "failed_tests": 0,
+                        "test_errors": 0,
+                    },
+                },
+            )
+        )
+
+    def test_objective_tests_green_allows_later_successful_edit(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        self.assertTrue(
+            engine._objective_tests_green(
+                objective="Fix failing tests in demo_project only. Run pytest -q demo_project/tests.",
+                tool_payloads=[
+                    {
+                        "tool": "edit_file",
+                        "args": {"path": "demo_project/utils.py"},
+                        "result": {"ok": False, "error": "find_text not found"},
+                    },
+                    {
+                        "tool": "edit_file",
+                        "args": {"path": "demo_project/utils.py"},
+                        "result": {"ok": True},
+                    },
+                ],
+                workspace_validation={
+                    "ok": True,
+                    "tests_passed": True,
+                    "tests": {"command": "pytest -q demo_project/tests"},
+                    "validation_signals": {
+                        "validation_completed": True,
+                        "tests_passed": True,
+                        "failed_tests": 0,
+                        "test_errors": 0,
+                    },
+                },
+            )
+        )
+
+    def test_should_run_validation_tests_ignores_read_only_fix_turn(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        should_validate = engine._should_run_validation_tests(
+            PlanStep(step_id=1, action="fix auth"),
+            payloads=[
+                {
+                    "tool": "read_file",
+                    "args": {"path": "auth.py"},
+                    "result": {"ok": True},
+                }
+            ],
+        )
+        self.assertFalse(should_validate)
+
+    def test_validate_workspace_after_step_reuses_target_test_scope(self):
+        tools = _CaptureTools()
+        engine = ChatEngine(model=_DummyModel(), tools=tools, system_prompt="test")
+        result = engine._maybe_validate_workspace_after_step(
+            step=PlanStep(step_id=1, action="apply fix"),
+            project_context={"test_runner": "pytest"},
+            payloads=[
+                {
+                    "tool": "edit_file",
+                    "args": {"path": "demo_project/utils.py"},
+                    "result": {"ok": True},
+                },
+                {
+                    "tool": "execute_command",
+                    "args": {"cmd": "pytest -q demo_project/tests"},
+                    "result": {"ok": False, "exit_code": 1},
+                },
+            ],
+            objective="Fix failing tests in demo_project only. Run pytest -q demo_project/tests.",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            tools.calls[-1],
+            (
+                "validate_workspace_changes",
+                {
+                    "path": ".",
+                    "test_runner": "pytest",
+                    "test_args": "demo_project/tests",
+                    "timeout": 180,
+                    "focus_paths": ["demo_project/utils.py"],
+                },
+            ),
+        )
+
+    def test_recent_tool_payloads_keeps_interleaved_tool_history(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        engine.history = [
+            {"role": "assistant", "content": "{\"tool\":\"run_tests\",\"args\":{}}"},
+            {
+                "role": "tool",
+                "content": json.dumps({"tool": "run_tests", "args": {"path": "."}, "result": {"ok": True}}),
+            },
+            {"role": "assistant", "content": "status"},
+            {
+                "role": "tool",
+                "content": json.dumps({"tool": "read_file", "args": {"path": "demo_project/utils.py"}, "result": {"ok": True}}),
+            },
+        ]
+        payloads = engine._recent_tool_payloads(limit=8)
+        self.assertEqual([item["tool"] for item in payloads], ["run_tests", "read_file"])
+
+    def test_build_test_repair_prompt_includes_execution_contract(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        prompt = engine._build_test_repair_prompt(
+            objective="Fix failing tests in demo_project only. Run pytest -q demo_project/tests.",
+            step=PlanStep(step_id=1, action="fix failing test"),
+            workspace_validation={
+                "validation_signals": {
+                    "tests_passed": False,
+                    "failed_tests": 1,
+                    "test_errors": 0,
+                    "test_failures": [
+                        {
+                            "nodeid": "demo_project/tests/test_main.py::test_add",
+                            "message": "assert -1 == 5",
+                        }
+                    ],
+                }
+            },
+            attempt_no=0,
+        )
+        self.assertIn("Execution contract for this step:", prompt)
+        self.assertIn("Tool budget for this step: about 4 calls", prompt)
+        self.assertIn("Stop immediately once targeted tests are green", prompt)
+
     def test_validator_reports_collection_error_not_zero_counts_noise(self):
         engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
         validation = engine._validate_autonomous_step_execution(
@@ -474,6 +870,7 @@ class TestStructuredPlanner(unittest.TestCase):
             system_prompt="test",
         )
         solved, payloads, validation, history = engine._maybe_apply_immediate_fix_from_observation(
+            objective="Fix failing tests in demo_project only. Run pytest -q demo_project/tests.",
             step=PlanStep(step_id=1, action="inspect failing tests"),
             workspace_validation={
                 "validation_signals": {
@@ -515,9 +912,438 @@ class TestStructuredPlanner(unittest.TestCase):
         )
         self.assertTrue(solved)
         self.assertEqual(payloads[0]["tool"], "edit_file")
-        self.assertEqual(payloads[0]["args"]["path"], "demo_project/utils.py")
+        self.assertEqual(payloads[-1]["args"]["path"], "demo_project/utils.py")
+        self.assertFalse(any(item["tool"] == "search_project" for item in payloads))
         self.assertTrue(validation["validation_signals"]["tests_passed"])
         self.assertEqual(history["kind"], "immediate_fix")
+
+    def test_extract_root_cause_error_text_uses_failing_run_tests_payload(self):
+        text = ChatEngine._extract_root_cause_error_text(
+            None,
+            tool_payloads=[
+                {
+                    "tool": "run_tests",
+                    "result": {
+                        "ok": True,
+                        "tests_passed": False,
+                        "stdout": "FAILED test_main.py::test_add - assert -1 == 5",
+                        "stderr": "",
+                        "test_failures": [
+                            {
+                                "nodeid": "test_main.py::test_add",
+                                "message": "assert -1 == 5",
+                                "summary": "FAILED test_main.py::test_add - assert -1 == 5",
+                            }
+                        ],
+                    },
+                }
+            ],
+        )
+        self.assertIn("assert -1 == 5", text)
+
+    def test_immediate_fix_trigger_can_read_context_from_run_tests_payload(self):
+        class _SupplementTools:
+            def __init__(self):
+                self.calls = []
+                self.memory_store = None
+
+            def execute(self, name, args):
+                self.calls.append((name, dict(args)))
+                if name == "search_project":
+                    if str(args.get("query", "")) == "def add(":
+                        return {
+                            "ok": True,
+                            "count": 1,
+                            "matches": [
+                                {
+                                    "path": "demo_project/utils.py",
+                                    "line": 1,
+                                    "text": "def add(a: int, b: int) -> int:",
+                                }
+                            ],
+                        }
+                    return {"ok": True, "count": 0, "matches": []}
+                if name == "read_file":
+                    path = str(args.get("path", ""))
+                    if path == "demo_project/tests/test_main.py":
+                        return {
+                            "ok": True,
+                            "path": path,
+                            "content": "from demo_project.utils import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+                        }
+                    if path == "demo_project/utils.py":
+                        return {
+                            "ok": True,
+                            "path": path,
+                            "content": "def add(a: int, b: int) -> int:\n    return a - b\n",
+                        }
+                if name == "edit_file":
+                    return {"ok": True, "path": args.get("path", ""), "replacements": 1}
+                if name == "validate_workspace_changes":
+                    return {
+                        "ok": True,
+                        "tests_passed": True,
+                        "validation_signals": {
+                            "validation_completed": True,
+                            "tests_passed": True,
+                            "failed_tests": 0,
+                            "test_errors": 0,
+                            "has_diff": True,
+                            "changed_file_count": 1,
+                        },
+                    }
+                return {"ok": True}
+
+        tools = _SupplementTools()
+        engine = ChatEngine(model=_DummyModel(), tools=tools, system_prompt="test")
+        solved, payloads, validation, history = engine._maybe_apply_immediate_fix_from_observation(
+            objective="Fix failing tests in demo_project only. Run pytest -q demo_project/tests.",
+            step=PlanStep(step_id=1, action="inspect failing tests"),
+            workspace_validation=None,
+            current_tool_payloads=[
+                {
+                    "tool": "run_tests",
+                    "args": {"path": "demo_project/tests", "runner": "pytest", "args": "-q"},
+                    "result": {
+                        "ok": True,
+                        "tests_passed": False,
+                        "path": "demo_project/tests",
+                        "test_failures": [
+                            {
+                                "nodeid": "test_main.py::test_add",
+                                "message": "assert -1 == 5",
+                                "summary": "FAILED test_main.py::test_add - assert -1 == 5",
+                            }
+                        ],
+                        "stdout": "FAILED test_main.py::test_add - assert -1 == 5",
+                        "stderr": "",
+                    },
+                }
+            ],
+            project_context={"test_runner": "pytest"},
+            auto_metrics={"tool_calls": 0, "failed_tool_calls": 0},
+        )
+        self.assertTrue(solved)
+        self.assertEqual(payloads[0]["tool"], "search_project")
+        self.assertEqual(payloads[0]["args"]["path"], "demo_project")
+        self.assertEqual(payloads[1]["tool"], "read_file")
+        self.assertTrue(any(item["tool"] == "edit_file" for item in payloads))
+        self.assertTrue(validation["validation_signals"]["tests_passed"])
+        self.assertEqual(history["kind"], "immediate_fix")
+
+    def test_immediate_fix_context_reads_reuse_existing_step_reads(self):
+        class _CachedReadTools:
+            def __init__(self):
+                self.calls = []
+                self.memory_store = None
+
+            def execute(self, name, args):
+                self.calls.append((name, dict(args)))
+                if name == "search_project":
+                    if str(args.get("query", "")) == "def add(":
+                        return {
+                            "ok": True,
+                            "count": 1,
+                            "matches": [
+                                {
+                                    "path": "demo_project/utils.py",
+                                    "line": 1,
+                                    "text": "def add(a: int, b: int) -> int:",
+                                }
+                            ],
+                        }
+                    return {"ok": True, "count": 0, "matches": []}
+                if name == "read_file":
+                    path = str(args.get("path", ""))
+                    if path == "demo_project/utils.py":
+                        return {
+                            "ok": True,
+                            "path": path,
+                            "content": "def add(a: int, b: int) -> int:\n    return a - b\n",
+                        }
+                if name == "edit_file":
+                    return {"ok": True, "path": args.get("path", ""), "replacements": 1}
+                if name == "validate_workspace_changes":
+                    return {
+                        "ok": True,
+                        "tests_passed": True,
+                        "tests": {"command": "pytest -q demo_project/tests"},
+                        "validation_signals": {
+                            "validation_completed": True,
+                            "tests_passed": True,
+                            "failed_tests": 0,
+                            "test_errors": 0,
+                            "has_diff": True,
+                            "changed_file_count": 1,
+                        },
+                    }
+                return {"ok": True}
+
+        tools = _CachedReadTools()
+        engine = ChatEngine(model=_DummyModel(), tools=tools, system_prompt="test")
+        solved, _, _, _ = engine._maybe_apply_immediate_fix_from_observation(
+            objective="Fix failing tests in demo_project only. Run pytest -q demo_project/tests.",
+            step=PlanStep(step_id=1, action="inspect failing tests"),
+            workspace_validation=None,
+            current_tool_payloads=[
+                {
+                    "tool": "read_file",
+                    "args": {"path": "demo_project/tests/test_main.py"},
+                    "result": {
+                        "ok": True,
+                        "path": "demo_project/tests/test_main.py",
+                        "content": "from demo_project.utils import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+                    },
+                },
+                {
+                    "tool": "run_tests",
+                    "args": {"path": "demo_project/tests", "runner": "pytest", "args": "-q"},
+                    "result": {
+                        "ok": True,
+                        "tests_passed": False,
+                        "path": "demo_project/tests",
+                        "test_failures": [
+                            {
+                                "nodeid": "test_main.py::test_add",
+                                "message": "assert -1 == 5",
+                                "summary": "FAILED test_main.py::test_add - assert -1 == 5",
+                            }
+                        ],
+                        "stdout": "FAILED test_main.py::test_add - assert -1 == 5",
+                        "stderr": "",
+                    },
+                },
+            ],
+            project_context={"test_runner": "pytest"},
+            auto_metrics={"tool_calls": 0, "failed_tool_calls": 0},
+        )
+
+        self.assertTrue(solved)
+        read_calls = [call for call in tools.calls if call[0] == "read_file"]
+        self.assertEqual(
+            read_calls,
+            [
+                (
+                    "read_file",
+                    {
+                        "path": "demo_project/utils.py",
+                        "start_line": 1,
+                        "end_line": 21,
+                        "max_chars": 4000,
+                    },
+                )
+            ],
+        )
+
+    def test_immediate_fix_emits_visible_tool_events(self):
+        tools = _ImmediateFixTools()
+        engine = ChatEngine(
+            model=_DummyModel(),
+            tools=tools,
+            system_prompt="test",
+        )
+        starts = []
+        events = []
+        original_start = chat_engine_module.print_tool_start
+        original_event = chat_engine_module.print_tool_event
+        chat_engine_module.print_tool_start = lambda name, args: starts.append((name, dict(args)))
+        chat_engine_module.print_tool_event = (
+            lambda name, args, result: events.append((name, dict(args), dict(result)))
+        )
+        try:
+            solved, payloads, validation, history = engine._maybe_apply_immediate_fix_from_observation(
+                objective="Fix failing tests in demo_project only. Run pytest -q demo_project/tests.",
+                step=PlanStep(step_id=1, action="inspect failing tests"),
+                workspace_validation={
+                    "validation_signals": {
+                        "validation_completed": True,
+                        "tests_passed": False,
+                        "failed_tests": 1,
+                        "test_errors": 0,
+                        "test_failures": [
+                            {
+                                "nodeid": "demo_project/tests/test_main.py::test_add",
+                                "message": "AssertionError: assert -1 == 5",
+                                "summary": "FAILED demo_project/tests/test_main.py::test_add - AssertionError: assert -1 == 5",
+                            }
+                        ],
+                    }
+                },
+                current_tool_payloads=[
+                    {
+                        "tool": "read_file",
+                        "args": {"path": "demo_project/tests/test_main.py"},
+                        "result": {
+                            "ok": True,
+                            "path": "demo_project/tests/test_main.py",
+                            "content": "from demo_project.utils import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+                        },
+                    },
+                    {
+                        "tool": "read_file",
+                        "args": {"path": "demo_project/utils.py"},
+                        "result": {
+                            "ok": True,
+                            "path": "demo_project/utils.py",
+                            "content": "def add(a: int, b: int) -> int:\n    return a - b  # BUG\n",
+                        },
+                    },
+                ],
+                project_context={"test_runner": "pytest"},
+                auto_metrics={"tool_calls": 0, "failed_tool_calls": 0},
+            )
+        finally:
+            chat_engine_module.print_tool_start = original_start
+            chat_engine_module.print_tool_event = original_event
+        self.assertTrue(solved)
+        self.assertEqual(starts[0][0], "edit_file")
+        self.assertEqual(events[0][0], "edit_file")
+        self.assertEqual(payloads[-1]["tool"], "edit_file")
+        self.assertTrue(any(name == "edit_file" for name, _ in starts))
+        self.assertFalse(any(name == "search_project" for name, _ in starts))
+        self.assertTrue(validation["validation_signals"]["tests_passed"])
+        self.assertEqual(history["kind"], "immediate_fix")
+
+    def test_immediate_fix_records_repair_pattern_on_success(self):
+        store = _StubLearningStore()
+
+        class _LearningImmediateFixTools(_ImmediateFixTools):
+            def __init__(self, memory_store):
+                super().__init__()
+                self.memory_store = memory_store
+
+        tools = _LearningImmediateFixTools(store)
+        engine = ChatEngine(model=_DummyModel(), tools=tools, system_prompt="test")
+        solved, _, validation, history = engine._maybe_apply_immediate_fix_from_observation(
+            objective="Fix failing tests in demo_project only. Run pytest -q demo_project/tests.",
+            step=PlanStep(step_id=1, action="inspect failing tests"),
+            workspace_validation={
+                "validation_signals": {
+                    "validation_completed": True,
+                    "tests_passed": False,
+                    "failed_tests": 1,
+                    "test_errors": 0,
+                    "test_failures": [
+                        {
+                            "nodeid": "demo_project/tests/test_main.py::test_add",
+                            "message": "AssertionError: assert -1 == 5",
+                            "summary": "FAILED demo_project/tests/test_main.py::test_add - AssertionError: assert -1 == 5",
+                        }
+                    ],
+                }
+            },
+            current_tool_payloads=[
+                {
+                    "tool": "read_file",
+                    "args": {"path": "demo_project/tests/test_main.py"},
+                    "result": {
+                        "ok": True,
+                        "path": "demo_project/tests/test_main.py",
+                        "content": "from demo_project.utils import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+                    },
+                },
+                {
+                    "tool": "read_file",
+                    "args": {"path": "demo_project/utils.py"},
+                    "result": {
+                        "ok": True,
+                        "path": "demo_project/utils.py",
+                        "content": "def add(a: int, b: int) -> int:\n    return a - b  # BUG\n",
+                    },
+                },
+            ],
+            project_context={"test_runner": "pytest"},
+            auto_metrics={"tool_calls": 0, "failed_tool_calls": 0},
+        )
+        self.assertTrue(solved)
+        self.assertTrue(validation["validation_signals"]["tests_passed"])
+        self.assertEqual(history["kind"], "immediate_fix")
+        self.assertEqual(len(store.repair_patterns), 1)
+        self.assertEqual(store.repair_patterns[0]["pattern"], "operator mismatch")
+        self.assertEqual(store.repair_patterns[0]["function_name"], "add")
+        self.assertEqual(store.repair_patterns[0]["context"], "simple arithmetic function")
+        self.assertIn("return a - b", store.repair_patterns[0]["before"])
+        self.assertIn("return a + b", store.repair_patterns[0]["after"])
+
+    def test_repair_loop_checks_repair_pattern_memory_before_debugging(self):
+        store = _StubLearningStore()
+        store.repair_pattern_matches = [
+            {
+                "pattern": "operator mismatch",
+                "before": "return a - b",
+                "after": "return a + b",
+                "context": "simple arithmetic function",
+                "confidence": 0.95,
+                "score": 0.91,
+            }
+        ]
+
+        class _LearningImmediateFixTools(_ImmediateFixTools):
+            def __init__(self, memory_store):
+                super().__init__()
+                self.memory_store = memory_store
+
+        tools = _LearningImmediateFixTools(store)
+        engine = ChatEngine(model=_DummyModel(), tools=tools, system_prompt="test")
+        engine._maybe_apply_immediate_fix_from_observation = lambda **kwargs: self.fail(
+            "repair pattern memory should run before immediate debugging"
+        )
+        engine._maybe_apply_root_cause_fix = lambda **kwargs: self.fail(
+            "repair pattern memory should resolve before root-cause templates"
+        )
+
+        latest_text, payloads, validation, history = engine._maybe_run_test_driven_repair(
+            objective="Fix failing tests in demo_project only. Run pytest -q demo_project/tests.",
+            step=PlanStep(step_id=1, action="inspect failing tests"),
+            workspace_validation={
+                "validation_signals": {
+                    "validation_completed": True,
+                    "tests_passed": False,
+                    "failed_tests": 1,
+                    "test_errors": 0,
+                    "test_failures": [
+                        {
+                            "nodeid": "demo_project/tests/test_main.py::test_add",
+                            "message": "AssertionError: assert -1 == 5",
+                            "summary": "FAILED demo_project/tests/test_main.py::test_add - AssertionError: assert -1 == 5",
+                        }
+                    ],
+                }
+            },
+            current_tool_payloads=[
+                {
+                    "tool": "read_file",
+                    "args": {"path": "demo_project/tests/test_main.py"},
+                    "result": {
+                        "ok": True,
+                        "path": "demo_project/tests/test_main.py",
+                        "content": "from demo_project.utils import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+                    },
+                },
+                {
+                    "tool": "read_file",
+                    "args": {"path": "demo_project/utils.py"},
+                    "result": {
+                        "ok": True,
+                        "path": "demo_project/utils.py",
+                        "content": "def add(a: int, b: int) -> int:\n    return a - b  # BUG\n",
+                    },
+                },
+            ],
+            project_context={"test_runner": "pytest"},
+            auto_metrics={
+                "tool_calls": 0,
+                "failed_tool_calls": 0,
+                "test_repair_attempts": 0,
+                "est_tokens_out": 0,
+            },
+        )
+        self.assertIn("learned repair pattern", latest_text or "")
+        self.assertTrue(any(item.get("kind") == "repair_pattern" for item in history))
+        self.assertTrue(validation["validation_signals"]["tests_passed"])
+        self.assertTrue(any(item.get("tool") == "edit_file" for item in payloads))
+        self.assertFalse(any(name == "search_project" for name, _ in tools.calls))
+        self.assertFalse(any(name == "read_file" for name, _ in tools.calls))
 
     def test_coerce_structured_plan(self):
         payload = {
@@ -915,6 +1741,60 @@ class TestStructuredPlanner(unittest.TestCase):
         self.assertGreaterEqual(len(history), 2)
         self.assertEqual(history[-1].get("skipped"), "duplicate_hypothesis")
 
+    def test_repair_loop_caps_analysis_for_single_target_failure(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        step = PlanStep(step_id=1, action="fix auth")
+        workspace_validation = {
+            "validation_signals": {
+                "tests_passed": False,
+                "failed_tests": 1,
+                "test_errors": 0,
+                "test_failures": [
+                    {
+                        "nodeid": "tests/test_auth.py::test_login",
+                        "summary": "FAILED tests/test_auth.py::test_login - AssertionError",
+                    }
+                ],
+            }
+        }
+        engine.autonomous_test_repair_attempts = 3
+        engine._maybe_apply_root_cause_fix = lambda **kwargs: (
+            False,
+            [],
+            workspace_validation,
+            None,
+        )
+        hypothesis_calls = {"n": 0}
+
+        def _fake_hypothesis(**kwargs):
+            hypothesis_calls["n"] += 1
+            return {
+                "hypothesis": "token not returned",
+                "suspected_files": ["auth.py"],
+                "confidence": 0.7,
+            }
+
+        engine._propose_test_failure_hypothesis = _fake_hypothesis
+        engine.handle_turn_stream = lambda *args, **kwargs: "patched"
+        engine._recent_tool_payloads = lambda limit=8: []
+        engine._maybe_validate_workspace_after_step = lambda **kwargs: workspace_validation
+
+        engine._maybe_run_test_driven_repair(
+            objective="fix auth tests",
+            step=step,
+            workspace_validation=workspace_validation,
+            current_tool_payloads=[],
+            project_context={},
+            auto_metrics={
+                "tool_calls": 0,
+                "failed_tool_calls": 0,
+                "test_repair_attempts": 0,
+                "est_tokens_out": 0,
+            },
+        )
+
+        self.assertEqual(hypothesis_calls["n"], 1)
+
     def test_root_cause_error_text_includes_failed_tool_errors(self):
         text = ChatEngine._extract_root_cause_error_text(
             {"validation_signals": {}},
@@ -948,6 +1828,7 @@ class TestStructuredPlanner(unittest.TestCase):
             system_prompt="test",
         )
         solved, payloads, _, history = engine._maybe_apply_root_cause_fix(
+            objective="fix import failures",
             step=PlanStep(step_id=1, action="fix imports"),
             workspace_validation={
                 "validation_signals": {
@@ -1331,6 +2212,66 @@ class TestStructuredPlanner(unittest.TestCase):
         engine.run_autonomous("capture failures", steps=2)
         # Should advance and finish after one step instead of retrying step 1.
         self.assertEqual(call_count["n"], 1)
+
+    def test_run_autonomous_exits_before_validator_after_green_repair(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_AutoTools(), system_prompt="test")
+        engine._create_task_state = lambda objective, step_cap=None: TaskState(
+            goal=objective,
+            steps=[
+                PlanStep(
+                    step_id=1,
+                    action="run_tests",
+                    args={"path": ".", "runner": "pytest", "args": "demo_project/tests"},
+                )
+            ],
+            current_step=0,
+            completed_step_ids=set(),
+            history=[],
+        )
+        engine.handle_turn_stream = lambda *args, **kwargs: "Captured failing tests."
+        engine._recent_tool_payloads = lambda limit=8: [
+            {
+                "tool": "run_tests",
+                "args": {"path": ".", "runner": "pytest", "args": "demo_project/tests"},
+                "result": {"ok": False, "exit_code": 1},
+            }
+        ]
+        engine._maybe_validate_workspace_after_step = lambda **kwargs: None
+        engine._maybe_run_test_driven_repair = lambda **kwargs: (
+            "Applied immediate fix.",
+            [
+                {
+                    "tool": "edit_file",
+                    "args": {"path": "demo_project/utils.py"},
+                    "result": {"ok": True},
+                }
+            ],
+            {
+                "ok": True,
+                "tests_passed": True,
+                "tests": {"command": "pytest -q demo_project/tests"},
+                "validation_signals": {
+                    "validation_completed": True,
+                    "tests_passed": True,
+                    "failed_tests": 0,
+                    "test_errors": 0,
+                    "has_diff": True,
+                    "changed_file_count": 1,
+                },
+            },
+            [{"kind": "immediate_fix"}],
+        )
+        engine._validate_autonomous_step_execution = lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("validator should not run after green repair")
+        )
+        engine._reflect_autonomous_progress = lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("reflection should not run after green repair")
+        )
+
+        engine.run_autonomous(
+            "Fix failing tests in demo_project only. Run pytest -q demo_project/tests.",
+            steps=1,
+        )
 
     def test_run_autonomous_retry_consumes_finite_step_budget(self):
         engine = ChatEngine(model=_DummyModel(), tools=_AutoTools(), system_prompt="test")

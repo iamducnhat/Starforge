@@ -33,6 +33,9 @@ class MemoryStore:
         self._strategy_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._root_cause_cache: dict[str, list[dict[str, Any]]] = {}
         self._root_cause_index: dict[str, tuple[Path, int]] = {}
+        self.repair_patterns_path = self.root_causes_dir / "repair_patterns.json"
+        self._repair_pattern_cache: list[dict[str, Any]] = []
+        self._repair_pattern_index: dict[str, int] = {}
         self._knowledge_cache: OrderedDict[str, str] = OrderedDict()
         self.max_hot_knowledge_blocks = max(
             16, min(get_env_int("ASSISTANT_MAX_HOT_KNOWLEDGE_BLOCKS", 128), 4096)
@@ -48,6 +51,7 @@ class MemoryStore:
         self._load_metadata()  # Initial load
         self._load_strategies()
         self._load_root_causes()
+        self._load_repair_patterns()
 
     def _load_stats(self) -> None:
         try:
@@ -315,6 +319,8 @@ class MemoryStore:
                 write_json(path, [])
             paths.append(path)
         for path in sorted(self.root_causes_dir.glob("*.json")):
+            if path == self.repair_patterns_path:
+                continue
             if path not in paths:
                 paths.append(path)
         return paths
@@ -334,6 +340,93 @@ class MemoryStore:
             cache[path.name] = ranked
         self._root_cause_cache = cache
         self._root_cause_index = index
+
+    @staticmethod
+    def _normalize_repair_pattern_entry(raw_entry: Any, *, idx: int) -> dict[str, Any] | None:
+        if not isinstance(raw_entry, dict):
+            return None
+        pattern = str(raw_entry.get("pattern", "")).strip()
+        before = str(raw_entry.get("before", "")).strip()
+        after = str(raw_entry.get("after", "")).strip()
+        if not pattern or not before or not after:
+            return None
+        function_name = str(raw_entry.get("function_name", "")).strip()
+        context = str(raw_entry.get("context", "")).strip()
+        entry_id = str(raw_entry.get("id", "")).strip() or f"repair_pattern_{idx}"
+        try:
+            confidence = float(raw_entry.get("confidence", 0.5))
+        except Exception:
+            confidence = 0.5
+        return {
+            "id": entry_id,
+            "pattern": pattern,
+            "before": before,
+            "after": after,
+            "context": context,
+            "function_name": function_name,
+            "success_count": int(raw_entry.get("success_count", 0) or 0),
+            "fail_count": int(raw_entry.get("fail_count", 0) or 0),
+            "confidence": max(0.0, min(confidence, 1.0)),
+        }
+
+    @staticmethod
+    def _repair_pattern_fingerprint(
+        pattern: str,
+        before: str,
+        after: str,
+        context: str,
+        function_name: str,
+    ) -> str:
+        key_basis = json.dumps(
+            {
+                "pattern": pattern,
+                "before": before,
+                "after": after,
+                "context": context,
+                "function_name": function_name,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return blake2b(key_basis.encode("utf-8"), digest_size=10).hexdigest()
+
+    @staticmethod
+    def _extract_repair_pattern_operator(text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        match = re.search(
+            r"\breturn\s+[A-Za-z_][A-Za-z0-9_]*\s*([+\-*/])\s*[A-Za-z_][A-Za-z0-9_]*\b",
+            raw,
+        )
+        if match:
+            return str(match.group(1)).strip()
+        match = re.search(
+            r"\b[A-Za-z_][A-Za-z0-9_]*\s*([+\-*/])\s*[A-Za-z_][A-Za-z0-9_]*\b",
+            raw,
+        )
+        if match:
+            return str(match.group(1)).strip()
+        return ""
+
+    def _load_repair_patterns(self) -> None:
+        if not self.repair_patterns_path.exists():
+            write_json(self.repair_patterns_path, [])
+        try:
+            payload = read_json(self.repair_patterns_path)
+        except Exception:
+            payload = []
+        entries = payload if isinstance(payload, list) else []
+        normalized: list[dict[str, Any]] = []
+        index: dict[str, int] = {}
+        for idx, raw_entry in enumerate(entries):
+            item = self._normalize_repair_pattern_entry(raw_entry, idx=idx)
+            if item is None:
+                continue
+            normalized.append(item)
+            index[str(item.get("id", "")).strip()] = len(normalized) - 1
+        self._repair_pattern_cache = normalized
+        self._repair_pattern_index = index
 
     @staticmethod
     def _root_cause_bucket_filename(
@@ -758,6 +851,187 @@ class MemoryStore:
         candidates.sort(key=lambda item: float(item.get("score", 0.0) or 0.0), reverse=True)
         return candidates[: max(1, limit)]
 
+    def find_repair_patterns(
+        self,
+        pattern: str,
+        before: str = "",
+        context: str = "",
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        return self.match_repair_pattern(
+            {
+                "pattern": pattern,
+                "before": before,
+                "context": context,
+            },
+            limit=limit,
+        )
+
+    def match_repair_pattern(
+        self,
+        failure_signature: dict[str, Any] | str,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        signature = failure_signature if isinstance(failure_signature, dict) else {}
+        if not signature and isinstance(failure_signature, str):
+            signature = {"pattern": str(failure_signature).strip()}
+        if not isinstance(signature, dict):
+            return []
+        requested_pattern = str(signature.get("pattern", "")).strip().lower()
+        requested_function = str(signature.get("function_name", "")).strip().lower()
+        requested_before = str(signature.get("before", "")).strip()
+        requested_context = str(signature.get("context", "")).strip().lower()
+        if not requested_pattern:
+            return []
+        runtime_operator = self._extract_repair_pattern_operator(requested_before)
+        candidates: list[dict[str, Any]] = []
+        for entry in self._repair_pattern_cache:
+            entry_pattern = str(entry.get("pattern", "")).strip().lower()
+            if entry_pattern != requested_pattern:
+                continue
+            entry_before = str(entry.get("before", "")).strip()
+            entry_context = str(entry.get("context", "")).strip()
+            entry_function = str(entry.get("function_name", "")).strip()
+            entry_operator = self._extract_repair_pattern_operator(entry_before)
+            before_score = 0.2
+            if requested_before and entry_before:
+                if requested_before == entry_before:
+                    before_score = 1.0
+                elif runtime_operator and runtime_operator == entry_operator:
+                    before_score = 0.9
+                elif requested_before.lower() in entry_before.lower() or entry_before.lower() in requested_before.lower():
+                    before_score = 0.7
+                else:
+                    before_score = 0.0
+            context_score = 0.2
+            if requested_context and entry_context:
+                lowered_entry_context = entry_context.lower()
+                if requested_context == lowered_entry_context:
+                    context_score = 1.0
+                elif requested_context in lowered_entry_context or lowered_entry_context in requested_context:
+                    context_score = 0.75
+                else:
+                    context_score = 0.0
+            function_score = 0.15
+            if requested_function and entry_function:
+                if requested_function == entry_function.lower():
+                    function_score = 1.0
+                else:
+                    function_score = 0.0
+            success = float(entry.get("success_count", 0.0) or 0.0)
+            failures = float(entry.get("fail_count", 0.0) or 0.0)
+            total = max(1.0, success + failures)
+            success_ratio = success / total
+            confidence = float(entry.get("confidence", 0.0) or 0.0)
+            score = (
+                (before_score * 0.35)
+                + (context_score * 0.15)
+                + (function_score * 0.15)
+                + (confidence * 0.2)
+                + (success_ratio * 0.15)
+            )
+            candidates.append(
+                {
+                    "id": entry.get("id", ""),
+                    "pattern": entry.get("pattern", ""),
+                    "before": entry_before,
+                    "after": entry.get("after", ""),
+                    "context": entry_context,
+                    "function_name": entry_function,
+                    "confidence": round(confidence, 3),
+                    "success_count": int(success),
+                    "fail_count": int(failures),
+                    "score": round(score, 3),
+                }
+            )
+        candidates.sort(key=lambda item: float(item.get("score", 0.0) or 0.0), reverse=True)
+        return candidates[: max(1, limit)]
+
+    def record_repair_pattern(
+        self,
+        pattern: str,
+        before: str,
+        after: str,
+        context: str = "",
+        confidence: float = 1.0,
+        function_name: str = "",
+        source: str = "runtime",
+    ) -> dict[str, Any]:
+        normalized_pattern = str(pattern or "").strip()
+        normalized_before = str(before or "").strip()
+        normalized_after = str(after or "").strip()
+        normalized_context = str(context or "").strip()
+        normalized_function_name = str(function_name or "").strip()
+        if not normalized_pattern:
+            return {"ok": False, "error": "pattern must not be empty"}
+        if not normalized_before or not normalized_after:
+            return {"ok": False, "error": "before and after must not be empty"}
+        target_fp = self._repair_pattern_fingerprint(
+            normalized_pattern,
+            normalized_before,
+            normalized_after,
+            normalized_context,
+            normalized_function_name,
+        )
+        entries = list(self._repair_pattern_cache)
+        match_idx = -1
+        for idx, item in enumerate(entries):
+            if not isinstance(item, dict):
+                continue
+            fp = self._repair_pattern_fingerprint(
+                str(item.get("pattern", "")).strip(),
+                str(item.get("before", "")).strip(),
+                str(item.get("after", "")).strip(),
+                str(item.get("context", "")).strip(),
+                str(item.get("function_name", "")).strip(),
+            )
+            if fp == target_fp:
+                match_idx = idx
+                break
+
+        conf = max(0.0, min(float(confidence), 1.0))
+        created = False
+        if match_idx >= 0:
+            entry = dict(entries[match_idx])
+            entry["success_count"] = int(entry.get("success_count", 0) or 0) + 1
+            current = float(entry.get("confidence", 0.5) or 0.5)
+            entry["confidence"] = round((current * 0.8) + (conf * 0.2), 4)
+            entries[match_idx] = entry
+        else:
+            created = True
+            entry = {
+                "id": f"repair_pattern_{blake2b(target_fp.encode('utf-8'), digest_size=5).hexdigest()}",
+                "pattern": normalized_pattern,
+                "before": normalized_before,
+                "after": normalized_after,
+                "context": normalized_context,
+                "function_name": normalized_function_name,
+                "success_count": 1,
+                "fail_count": 0,
+                "confidence": conf,
+            }
+            entries.append(entry)
+
+        serializable = [
+            {
+                "id": str(item.get("id", "")).strip(),
+                "pattern": str(item.get("pattern", "")).strip(),
+                "before": str(item.get("before", "")).strip(),
+                "after": str(item.get("after", "")).strip(),
+                "context": str(item.get("context", "")).strip(),
+                "function_name": str(item.get("function_name", "")).strip(),
+                "success_count": int(item.get("success_count", 0) or 0),
+                "fail_count": int(item.get("fail_count", 0) or 0),
+                "confidence": float(item.get("confidence", 0.0) or 0.0),
+                "source": str(source or "runtime"),
+            }
+            for item in entries
+            if isinstance(item, dict)
+        ]
+        write_json(self.repair_patterns_path, serializable)
+        self._load_repair_patterns()
+        return {"ok": True, "created": created, "entry": entry}
+
     def record_root_cause_feedback(
         self, root_cause_id: str, success: bool, confidence: float = 1.0
     ) -> dict[str, Any]:
@@ -926,9 +1200,11 @@ class MemoryStore:
         knowledge_before = len(self._knowledge_cache)
         strategy_before = len(self._strategy_cache)
         root_before = sum(len(entries) for entries in self._root_cause_cache.values())
+        repair_before = len(self._repair_pattern_cache)
         self._knowledge_cache.clear()
         self._load_strategies()
         self._load_root_causes()
+        self._load_repair_patterns()
         return {
             "knowledge_evicted": max(0, knowledge_before - len(self._knowledge_cache)),
             "strategy_evicted": max(0, strategy_before - len(self._strategy_cache)),
@@ -937,6 +1213,7 @@ class MemoryStore:
                 root_before
                 - sum(len(entries) for entries in self._root_cause_cache.values()),
             ),
+            "repair_pattern_evicted": max(0, repair_before - len(self._repair_pattern_cache)),
         }
 
     def semantic_search(

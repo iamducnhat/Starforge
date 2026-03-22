@@ -106,6 +106,50 @@ class RepairState:
     tried_hypotheses: list[str] = field(default_factory=list)
 
 
+@dataclass
+class ResolutionContext:
+    tests_passed: bool = False
+    build_passed: bool = False
+    lint_passed: bool = False
+    command_exit_code: int | None = None
+    output_valid: bool = False
+    user_confirmed: bool = False
+
+
+def resolution_succeeded(context: ResolutionContext) -> bool:
+    return any(
+        [
+            bool(context.tests_passed),
+            bool(context.build_passed),
+            bool(context.lint_passed),
+            context.command_exit_code == 0,
+            bool(context.output_valid),
+            bool(context.user_confirmed),
+        ]
+    )
+
+
+def compute_confidence(context: ResolutionContext) -> float:
+    evidence: list[float] = []
+    if bool(context.tests_passed):
+        evidence.append(0.98)
+    if bool(context.build_passed):
+        evidence.append(0.9)
+    if bool(context.lint_passed):
+        evidence.append(0.85)
+    if bool(context.output_valid):
+        evidence.append(0.82)
+    if bool(context.user_confirmed):
+        evidence.append(0.95)
+    if context.command_exit_code == 0:
+        evidence.append(0.55)
+    if not evidence:
+        return 0.0
+    base = max(evidence)
+    bonus = min(0.1, 0.03 * max(0, len(evidence) - 1))
+    return round(min(1.0, base + bonus), 3)
+
+
 class ChatEngine:
     def __init__(
         self,
@@ -194,6 +238,9 @@ class ChatEngine:
         self.autonomous_token_budget = max(
             0, get_env_int("ASSISTANT_AUTO_TOKEN_BUDGET", 0)
         )
+        self.autonomous_planner_timeout = max(
+            3, min(get_env_int("ASSISTANT_AUTO_PLANNER_TIMEOUT", 10), 60)
+        )
         self.autonomous_state_history_limit = max(
             50, min(get_env_int("ASSISTANT_AUTO_STATE_HISTORY_LIMIT", 300), 5000)
         )
@@ -217,6 +264,7 @@ class ChatEngine:
         self._autonomous_execution_active = False
         self._autonomous_tool_result_cache: dict[str, dict[str, Any]] = {}
         self._autonomous_workspace_epoch = 0
+        self._autonomous_step_search_hits: dict[str, list[int]] = {}
         # Set to a callable (e.g. cli_format.print_phase) to display internal
         # phase labels in the CLI.  Left as None in server mode to stay silent.
         self.on_status: Callable[[str], None] | None = None
@@ -930,6 +978,17 @@ class ChatEngine:
         ]
 
     @staticmethod
+    def _infer_pytest_scope_from_objective(objective: str) -> str:
+        objective_match = re.search(
+            r"pytest(?:\s+-[^\s]+)*\s+([A-Za-z0-9_./-]+(?:\s+[A-Za-z0-9_./:-]+)*)",
+            str(objective or ""),
+            flags=re.IGNORECASE,
+        )
+        if objective_match:
+            return str(objective_match.group(1)).strip().rstrip(".,;)]}")
+        return ""
+
+    @staticmethod
     def _coerce_structured_plan(payload: Any, fallback_goal: str) -> list[PlanStep]:
         items: list[Any] = []
         if isinstance(payload, dict):
@@ -1279,14 +1338,15 @@ class ChatEngine:
             "- Use compatibility aliases id/tool/expected if needed.\n"
         )
         try:
-            raw = self.model.generate(
+            raw = self._generate_model_text(
                 [
                     {
                         "role": "system",
                         "content": "You are a planner that returns JSON only.",
                     },
                     {"role": "user", "content": prompt},
-                ]
+                ],
+                timeout=self.autonomous_planner_timeout,
             )
             payload = parse_json_payload(self._strip_thinking(raw))
             generated: list[PlanStep] = []
@@ -1347,14 +1407,15 @@ class ChatEngine:
             f"Rules: 1..{cap} steps, unique ids, depends_on references earlier step ids only."
         )
         try:
-            raw = self.model.generate(
+            raw = self._generate_model_text(
                 [
                     {
                         "role": "system",
                         "content": "You are an execution planner. Return JSON only.",
                     },
                     {"role": "user", "content": planning_prompt},
-                ]
+                ],
+                timeout=self.autonomous_planner_timeout,
             )
             payload = parse_json_payload(self._strip_thinking(raw))
             coerced = self._coerce_structured_plan(payload, fallback_goal=objective)
@@ -1362,6 +1423,33 @@ class ChatEngine:
         except Exception:
             steps = self._fallback_plan_steps(fallback_goal=objective)
         return steps[:cap]
+
+    def _generate_model_text(
+        self,
+        messages: list[dict[str, Any]],
+        timeout: int | None = None,
+    ) -> str:
+        if not isinstance(timeout, int) or timeout <= 0 or not hasattr(self.model, "timeout"):
+            return self.model.generate(messages)
+        original_timeout = getattr(self.model, "timeout", None)
+        try:
+            if original_timeout is None:
+                setattr(self.model, "timeout", int(timeout))
+            else:
+                try:
+                    current_timeout = int(original_timeout)
+                except Exception:
+                    current_timeout = int(timeout)
+                setattr(self.model, "timeout", max(1, min(current_timeout, int(timeout))))
+            return self.model.generate(messages)
+        finally:
+            try:
+                if original_timeout is None:
+                    delattr(self.model, "timeout")
+                else:
+                    setattr(self.model, "timeout", original_timeout)
+            except Exception:
+                pass
 
     def _create_task_state(self, objective: str, step_cap: int | None = None) -> TaskState:
         steps = self._plan_objective_steps(objective, step_cap=step_cap)
@@ -1689,6 +1777,8 @@ class ChatEngine:
         step_text: str,
         final_text: str,
         tool_payloads: list[dict[str, Any]] | None = None,
+        execution_contract: dict[str, Any] | None = None,
+        tool_activity: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         tool_lines: list[str] = []
         for payload in (tool_payloads or [])[:6]:
@@ -1718,13 +1808,42 @@ class ChatEngine:
             if tool_lines
             else ""
         )
+        contract_lines: list[str] = []
+        contract = execution_contract if isinstance(execution_contract, dict) else {}
+        if contract:
+            contract_lines.append(
+                "Execution contract: "
+                f"mode={str(contract.get('mode', 'general')).strip() or 'general'}, "
+                f"tool_budget={contract.get('tool_budget', 0) or 'open'}, "
+                f"analysis_budget={contract.get('analysis_budget', 0) or 'open'}, "
+                f"stop_on_green={'yes' if contract.get('stop_on_green', False) else 'no'}"
+            )
+            preferred_flow = contract.get("preferred_flow", [])
+            if isinstance(preferred_flow, list) and preferred_flow:
+                contract_lines.append(
+                    "Preferred flow: " + " -> ".join(str(item).strip() for item in preferred_flow[:5] if str(item).strip())
+                )
+        activity = tool_activity if isinstance(tool_activity, dict) else {}
+        if activity:
+            contract_lines.append(
+                "Observed activity: "
+                f"tools={int(activity.get('total', 0) or 0)}, "
+                f"searches={int(activity.get('search_count', 0) or 0)}, "
+                f"reads={int(activity.get('read_count', 0) or 0)}, "
+                f"edits={int(activity.get('edit_count', 0) or 0)}, "
+                f"validations={int(activity.get('validation_count', 0) or 0)}, "
+                f"duplicate_reads={int(activity.get('duplicate_reads', 0) or 0)}"
+            )
+        contract_text = ("\n".join(contract_lines) + "\n") if contract_lines else ""
         prompt = (
             "You are supervising an autonomous coding loop.\n"
             "Return strict JSON with keys:\n"
             "next_action (advance|retry|replan|done|bored), reason (string), confidence (0..1), issues (array), new_steps (array optional).\n"
             "Do not repeat the same tool call unless the arguments changed or the workspace changed after a file edit.\n"
+            "Judge whether the observed activity stayed inside the execution contract. If it drifted, prefer replan or bored over retrying the same loop.\n"
             f"Goal: {state.goal}\n"
             f"Current step: {step_text}\n"
+            f"{contract_text}"
             f"{recent_tools_text}"
             f"Latest assistant output: {final_text[:2500]}"
         )
@@ -1853,14 +1972,41 @@ class ChatEngine:
                 "message": "create_function skipped because user asked for copyable function output.",
                 "code": code,
             }
+        if self._autonomous_execution_active and name == "read_file":
+            args = self._apply_autonomous_read_window(args)
         if self._autonomous_execution_active:
             cached = self._get_autonomous_cached_tool_result(name, args)
             if cached is not None:
                 return cached
         result = self.tools.execute(name, args)
+        if self._autonomous_execution_active and name == "search_project":
+            self._remember_autonomous_search_hits(result)
         if self._autonomous_execution_active:
             self._record_autonomous_tool_result(name, args, result)
         return result
+
+    def _execute_internal_autonomous_tool(
+        self,
+        name: str,
+        args: dict[str, Any],
+        *,
+        source: str,
+    ) -> dict[str, Any]:
+        safe_args = dict(args or {})
+        if self._autonomous_execution_active and name == "read_file":
+            safe_args = self._apply_autonomous_read_window(safe_args)
+        print_tool_start(name, safe_args)
+        result = self.tools.execute(name, safe_args)
+        if self._autonomous_execution_active and name == "search_project":
+            self._remember_autonomous_search_hits(result)
+        print_tool_event(name, safe_args, result)
+        payload = {
+            "tool": name,
+            "args": safe_args,
+            "result": result,
+            "source": source,
+        }
+        return payload
 
     @staticmethod
     def _tool_call_cache_key(name: str, args: dict[str, Any]) -> str:
@@ -1869,6 +2015,47 @@ class ChatEngine:
         except Exception:
             args_blob = str(args)
         return f"{str(name or '').strip().lower()}::{args_blob}"
+
+    def _remember_autonomous_search_hits(self, result: dict[str, Any]) -> None:
+        if not isinstance(result, dict) or not result.get("ok", False):
+            return
+        matches = result.get("matches", [])
+        if not isinstance(matches, list):
+            return
+        for item in matches:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path", "")).strip()
+            try:
+                line = int(item.get("line", 0) or 0)
+            except Exception:
+                line = 0
+            if not path or line <= 0:
+                continue
+            lines = self._autonomous_step_search_hits.setdefault(path, [])
+            if line not in lines:
+                lines.append(line)
+            if len(lines) > 8:
+                del lines[:-8]
+
+    def _apply_autonomous_read_window(self, args: dict[str, Any]) -> dict[str, Any]:
+        safe_args = dict(args or {})
+        path = str(safe_args.get("path", "")).strip()
+        if not path:
+            return safe_args
+        start_line = safe_args.get("start_line")
+        end_line = safe_args.get("end_line")
+        if start_line is not None or end_line is not None:
+            safe_args["max_chars"] = min(int(safe_args.get("max_chars", 4000) or 4000), 4000)
+            return safe_args
+        hit_lines = self._autonomous_step_search_hits.get(path, [])
+        if not hit_lines:
+            return safe_args
+        anchor = int(hit_lines[0])
+        safe_args["start_line"] = max(1, anchor - 20)
+        safe_args["end_line"] = anchor + 20
+        safe_args["max_chars"] = min(int(safe_args.get("max_chars", 4000) or 4000), 4000)
+        return safe_args
 
     @staticmethod
     def _is_read_only_execute_command(cmd: str) -> bool:
@@ -2884,6 +3071,7 @@ class ChatEngine:
         on_tool_phase: Callable[[], None] | None = None,
         enforce_presearch: bool = True,
         log_interaction: bool = True,
+        max_tool_rounds_override: int | None = None,
     ) -> str:
         self._maybe_enforce_memory_limits(context="handle_turn:start")
         self._append_history_message("user", user_message)
@@ -2896,7 +3084,8 @@ class ChatEngine:
         turn_tool_payloads: list[dict[str, Any]] = []
         assistant_action_text = ""
 
-        for _ in range(self.max_tool_rounds):
+        round_cap = max(1, int(max_tool_rounds_override or self.max_tool_rounds))
+        for _ in range(round_cap):
             assistant_text = ""
             in_think_stream = False
             pending_nonthink_chunks: list[str] = []
@@ -3614,6 +3803,12 @@ class ChatEngine:
                     )
                 current_step = state.steps[state.current_step]
                 current_step.status = "in_progress"
+                self._autonomous_step_search_hits.clear()
+                step_contract = self._build_autonomous_step_contract(
+                    objective=objective,
+                    step=current_step,
+                )
+                contract_text = self._render_autonomous_step_contract(step_contract)
                 context_line = ""
                 if project_context:
                     context_line = (
@@ -3630,16 +3825,27 @@ class ChatEngine:
                     + "\n".join(plan_lines)
                     + "\n"
                     + context_line
+                    + contract_text
                     + f"Current plan step ({state.current_step + 1}/{len(state.steps)}): {current_step.short_label()}\n"
                     + f"Current step args: {json.dumps(current_step.args, ensure_ascii=False)}\n"
                     + "Execute this current plan step now. Use tools as needed and stay in workspace root only.\n"
+                    + "Return the next tool call immediately. Do not restate the plan. Do not explain reasoning before using tools.\n"
+                    + "Search before read: use search_project or lookup_symbol before read_file.\n"
+                    + "When reading code, only read a tight window around the matched line (about +/-20 lines with start_line/end_line).\n"
+                    + "Do not read entire files, do not scan directories blindly, and do not re-read the same file without new evidence.\n"
+                    + "If you already have the exact target file and line, patch next instead of reading more.\n"
                     + "Do not call planning/todo tools during execution: create_plan, list_plans, get_plan, add_todo, update_todo.\n"
                     + "After execution, include a short status sentence.\n"
                     + "If finished, output a final line that starts with: AUTONOMOUS_DONE\n"
                     + "If no useful next action remains, output a final line that starts with: AUTONOMOUS_BORED"
                 )
-
                 print(f"\n[auto step {i}/{steps_text}]")
+                print(
+                    "[auto] contract: "
+                    f"mode={str(step_contract.get('mode', 'general')).strip() or 'general'}, "
+                    f"tool_budget={int(step_contract.get('tool_budget', 0) or 0) or '-'}, "
+                    f"analysis_budget={int(step_contract.get('analysis_budget', 0) or 0) or '-'}"
+                )
                 renderer = StreamRenderer()
                 response = self.handle_turn_stream(
                     prompt,
@@ -3649,14 +3855,15 @@ class ChatEngine:
                     renderer.prepare_tool_output,
                     enforce_presearch=False,
                     log_interaction=False,
+                    max_tool_rounds_override=self._tool_round_limit_for_contract(
+                        step_contract
+                    ),
                 )
                 renderer.finish()
                 # Save after every step so messages are on disk before the next
                 # step's _messages() call can compact them away.
                 self._flush_to_session_log()
                 final_text = extract_answer_text(response).strip()
-                auto_metrics["steps"] += 1
-                auto_metrics["est_tokens_out"] += max(1, len(response) // 4)
                 tool_payloads = self._recent_tool_payloads(limit=8)
                 auto_metrics["tool_calls"] += len(tool_payloads)
                 auto_metrics["failed_tool_calls"] += sum(
@@ -3667,6 +3874,49 @@ class ChatEngine:
                         and p.get("result", {}).get("ok", False)
                     )
                 )
+                workspace_validation = self._maybe_validate_workspace_after_step(
+                    step=current_step,
+                    project_context=project_context,
+                    payloads=tool_payloads,
+                    objective=objective,
+                )
+                repair_text, repaired_payloads, repaired_validation, repair_history = (
+                    self._maybe_run_test_driven_repair(
+                        objective=objective,
+                        step=current_step,
+                        workspace_validation=workspace_validation,
+                        current_tool_payloads=tool_payloads,
+                        project_context=project_context,
+                        auto_metrics=auto_metrics,
+                    )
+                )
+                if repair_text:
+                    final_text = repair_text
+                    tool_payloads = repaired_payloads
+                    workspace_validation = repaired_validation
+                else:
+                    repair_history = []
+                step_contract = self._build_autonomous_step_contract(
+                    objective=objective,
+                    step=current_step,
+                    workspace_validation=workspace_validation,
+                    tool_payloads=tool_payloads,
+                )
+                tool_activity = self._summarize_tool_activity(
+                    tool_payloads,
+                    workspace_validation=workspace_validation,
+                )
+                contract_violation = self._execution_contract_violation_reason(
+                    step_contract,
+                    tool_activity,
+                )
+                self._print_autonomous_step_audit(
+                    step_contract,
+                    tool_activity,
+                    contract_violation,
+                )
+                auto_metrics["steps"] += 1
+                auto_metrics["est_tokens_out"] += max(1, len(response) // 4)
                 tool_signature = self._autonomous_tool_signature()
                 if tool_signature and tool_signature == last_signature:
                     repeated_signature_count += 1
@@ -3707,27 +3957,23 @@ class ChatEngine:
                     self._print_auto_metrics(auto_metrics)
                     return
 
-                workspace_validation = self._maybe_validate_workspace_after_step(
-                    step=current_step,
-                    project_context=project_context,
-                    payloads=tool_payloads,
-                )
-                repair_text, repaired_payloads, repaired_validation, repair_history = (
-                    self._maybe_run_test_driven_repair(
-                        objective=objective,
-                        step=current_step,
-                        workspace_validation=workspace_validation,
-                        current_tool_payloads=tool_payloads,
-                        project_context=project_context,
-                        auto_metrics=auto_metrics,
+                if self._objective_tests_green(
+                    objective=objective,
+                    tool_payloads=tool_payloads,
+                    workspace_validation=workspace_validation,
+                ):
+                    current_step.status = "done"
+                    state.completed_step_ids.add(current_step.step_id)
+                    self._record_strategy_outcome(
+                        objective,
+                        state.steps,
+                        success=True,
+                        notes="targeted tests are green",
+                        context=project_context,
                     )
-                )
-                if repair_text:
-                    final_text = repair_text
-                    tool_payloads = repaired_payloads
-                    workspace_validation = repaired_validation
-                else:
-                    repair_history = []
+                    print("[auto] done: targeted tests are green")
+                    self._print_auto_metrics(auto_metrics)
+                    return
                 validation = self._validate_autonomous_step_execution(
                     step=current_step,
                     final_text=final_text,
@@ -3758,6 +4004,8 @@ class ChatEngine:
                     step_text=current_step.short_label(),
                     final_text=final_text,
                     tool_payloads=tool_payloads,
+                    execution_contract=step_contract,
+                    tool_activity=tool_activity,
                 )
                 action = str(progress.get("next_action", "advance")).lower()
                 reason = str(progress.get("reason", "")).strip()
@@ -3768,6 +4016,8 @@ class ChatEngine:
                 validation_issues = validation.get("issues", [])
                 if isinstance(validation_issues, list):
                     issues.extend(validation_issues[:3])
+                if contract_violation:
+                    issues.append(contract_violation)
                 if model_done and action not in {"retry", "replan"}:
                     action = "done"
                 if model_bored and action not in {"retry", "replan"}:
@@ -3805,6 +4055,13 @@ class ChatEngine:
                         f"{reason} | {validator_reason}".strip(" |")
                         if reason
                         else validator_reason
+                    )
+                if contract_violation and action in {"advance", "retry", "done"}:
+                    action = "replan"
+                    reason = (
+                        f"{reason} | contract violation: {contract_violation}".strip(" |")
+                        if reason
+                        else f"contract violation: {contract_violation}"
                     )
                 step_fingerprint = self._plan_step_fingerprint(current_step)
                 current_snapshot = self._test_failure_snapshot(workspace_validation)
@@ -3991,8 +4248,6 @@ class ChatEngine:
         payloads: list[dict[str, Any]] = []
         for msg in reversed(self.history):
             if msg.get("role") != "tool":
-                if payloads:
-                    break
                 continue
             try:
                 payload = json.loads(msg.get("content", ""))
@@ -4057,7 +4312,11 @@ class ChatEngine:
             if isinstance(raw_changed, list):
                 changed_files = [str(item).strip() for item in raw_changed if str(item).strip()]
 
-        if bool(after.get("tests_passed", False)):
+        resolution_context = cls._build_resolution_context(
+            workspace_validation=workspace_validation,
+            tool_payloads=[],
+        )
+        if resolution_succeeded(resolution_context) or bool(after.get("tests_passed", False)):
             impact = "resolved"
         elif after_total < before_total:
             impact = "improved"
@@ -4460,6 +4719,386 @@ class ChatEngine:
                 break
         return focused[:20]
 
+    @staticmethod
+    def _extract_pytest_scope_from_command(cmd: str) -> str:
+        text = str(cmd or "").strip()
+        if not text:
+            return ""
+        patterns = (
+            r"^pytest\b(?P<args>.+)$",
+            r"^python(?:3)?\s+-m\s+pytest\b(?P<args>.+)$",
+        )
+        args_text = ""
+        for pattern in patterns:
+            match = re.match(pattern, text)
+            if match:
+                args_text = str(match.group("args") or "").strip()
+                break
+        if not args_text:
+            return ""
+        tokens = re.findall(r"(?:[^\s\"']+|\"[^\"]*\"|'[^']*')+", args_text)
+        scope_tokens: list[str] = []
+        for token in tokens:
+            clean = token.strip().strip("\"'")
+            if not clean:
+                continue
+            if clean.startswith("-"):
+                continue
+            scope_tokens.append(clean)
+        return " ".join(scope_tokens[:8]).strip()
+
+    def _infer_validation_test_args(
+        self,
+        objective: str,
+        payloads: list[dict[str, Any]],
+    ) -> str:
+        for payload in reversed(payloads):
+            if not isinstance(payload, dict):
+                continue
+            tool_name = str(payload.get("tool", "")).strip()
+            args = payload.get("args", {})
+            result = payload.get("result", {})
+            if not isinstance(args, dict):
+                args = {}
+            if not isinstance(result, dict):
+                result = {}
+            if tool_name == "run_tests":
+                raw_args = str(args.get("args", "")).strip()
+                if raw_args:
+                    return raw_args
+                command = str(result.get("command", "")).strip()
+                inferred = self._extract_pytest_scope_from_command(command)
+                if inferred:
+                    return inferred
+            if tool_name == "execute_command":
+                inferred = self._extract_pytest_scope_from_command(str(args.get("cmd", "")))
+                if inferred:
+                    return inferred
+                inferred = self._extract_pytest_scope_from_command(
+                    str(result.get("cmd", ""))
+                )
+                if inferred:
+                    return inferred
+            if tool_name == "validate_workspace_changes":
+                raw_args = str(args.get("test_args", "")).strip()
+                if raw_args:
+                    return raw_args
+        return self._infer_pytest_scope_from_objective(objective)
+
+    @staticmethod
+    def _infer_search_root_from_test_scope(test_scope: str) -> str:
+        scope = str(test_scope or "").strip()
+        if not scope:
+            return "."
+        candidate = ""
+        for token in scope.split():
+            clean = token.strip().strip("\"'")
+            if not clean or clean.startswith("-"):
+                continue
+            candidate = clean
+            break
+        if not candidate:
+            return "."
+        first = candidate.split("::", 1)[0]
+        parts = [part for part in Path(first).parts if part not in {".", ""}]
+        if not parts:
+            return "."
+        if len(parts) == 1:
+            return parts[0]
+        return str(Path(*parts[:-1]))
+
+    def _build_autonomous_step_contract(
+        self,
+        objective: str,
+        step: PlanStep,
+        workspace_validation: dict[str, Any] | None = None,
+        tool_payloads: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        action = str(step.action or "").strip().lower()
+        objective_text = str(objective or "").strip().lower()
+        single_target = self._has_single_target_test_failure(
+            workspace_validation,
+            tool_payloads,
+        )
+        is_test_debug = bool(
+            single_target
+            or "test" in action
+            or "pytest" in action
+            or "test" in objective_text
+            or "pytest" in objective_text
+        )
+        if single_target:
+            return {
+                "mode": "single_target_test_debug",
+                "tool_budget": 4,
+                "analysis_budget": 1,
+                "require_search_before_read": True,
+                "stop_on_green": True,
+                "preferred_flow": [
+                    "locate target",
+                    "read one small code window",
+                    "patch",
+                    "validate targeted tests",
+                ],
+            }
+        if is_test_debug:
+            return {
+                "mode": "test_debug",
+                "tool_budget": 6,
+                "analysis_budget": 2,
+                "require_search_before_read": True,
+                "stop_on_green": True,
+                "preferred_flow": [
+                    "inspect failing test signal",
+                    "locate target",
+                    "read minimal context",
+                    "patch",
+                    "validate targeted tests",
+                ],
+            }
+        return {
+            "mode": "general",
+            "tool_budget": 0,
+            "analysis_budget": 0,
+            "require_search_before_read": False,
+            "stop_on_green": False,
+            "preferred_flow": [],
+        }
+
+    @staticmethod
+    def _render_autonomous_step_contract(contract: dict[str, Any]) -> str:
+        if not isinstance(contract, dict) or not contract:
+            return ""
+        mode = str(contract.get("mode", "general")).strip() or "general"
+        tool_budget = int(contract.get("tool_budget", 0) or 0)
+        analysis_budget = int(contract.get("analysis_budget", 0) or 0)
+        preferred_flow = contract.get("preferred_flow", [])
+        flow_text = (
+            " -> ".join(str(item).strip() for item in preferred_flow[:5] if str(item).strip())
+            if isinstance(preferred_flow, list)
+            else ""
+        )
+        lines = [
+            "Execution contract for this step:",
+            f"- Mode: {mode}",
+        ]
+        if tool_budget > 0:
+            lines.append(f"- Tool budget for this step: about {tool_budget} calls")
+        if analysis_budget > 0:
+            lines.append(f"- Analysis budget before patching: {analysis_budget} pass")
+        if contract.get("require_search_before_read", False):
+            lines.append("- Search or lookup before read_file")
+        if flow_text:
+            lines.append(f"- Preferred flow: {flow_text}")
+        if contract.get("stop_on_green", False):
+            lines.append("- Stop immediately once targeted tests are green")
+        lines.append("- Do not write a new plan for this step; execute the current step directly")
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _summarize_tool_activity(
+        tool_payloads: list[dict[str, Any]],
+        workspace_validation: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        counts: dict[str, int] = {}
+        mutating_tools = {"edit_file", "create_file", "write_file", "delete_file"}
+        search_tools = {"search_project", "lookup_symbol"}
+        duplicate_reads = 0
+        duplicate_calls = 0
+        mutated = False
+        tests_green = False
+        validation_green = False
+        seen_call_signatures: set[str] = set()
+        seen_read_paths: set[str] = set()
+        for payload in tool_payloads:
+            if not isinstance(payload, dict):
+                continue
+            tool_name = str(payload.get("tool", "")).strip()
+            if not tool_name:
+                continue
+            counts[tool_name] = int(counts.get(tool_name, 0) or 0) + 1
+            args = payload.get("args", {})
+            result = payload.get("result", {})
+            try:
+                call_signature = (
+                    f"{tool_name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
+                )
+            except Exception:
+                call_signature = f"{tool_name}:{str(args)}"
+            if call_signature in seen_call_signatures:
+                duplicate_calls += 1
+            else:
+                seen_call_signatures.add(call_signature)
+            if tool_name == "read_file" and isinstance(args, dict):
+                read_path = str(args.get("path", "")).strip()
+                if read_path:
+                    if read_path in seen_read_paths:
+                        duplicate_reads += 1
+                    else:
+                        seen_read_paths.add(read_path)
+            if (
+                tool_name in mutating_tools
+                and isinstance(result, dict)
+                and result.get("ok", False)
+            ):
+                mutated = True
+            if tool_name == "run_tests" and isinstance(result, dict) and result.get("tests_passed", False):
+                tests_green = True
+            if (
+                tool_name == "validate_workspace_changes"
+                and isinstance(result, dict)
+                and result.get("tests_passed", False)
+            ):
+                validation_green = True
+                tests_green = True
+        if isinstance(workspace_validation, dict):
+            if workspace_validation.get("tests_passed", False):
+                validation_green = True
+                tests_green = True
+            counts["validate_workspace_changes"] = max(
+                int(counts.get("validate_workspace_changes", 0) or 0),
+                1,
+            )
+        return {
+            "total": sum(counts.values()),
+            "counts": counts,
+            "search_count": sum(counts.get(name, 0) for name in search_tools),
+            "read_count": int(counts.get("read_file", 0) or 0),
+            "edit_count": int(counts.get("edit_file", 0) or 0)
+            + int(counts.get("create_file", 0) or 0)
+            + int(counts.get("write_file", 0) or 0)
+            + int(counts.get("delete_file", 0) or 0),
+            "validation_count": int(counts.get("validate_workspace_changes", 0) or 0),
+            "test_count": int(counts.get("run_tests", 0) or 0),
+            "duplicate_calls": duplicate_calls,
+            "duplicate_reads": duplicate_reads,
+            "mutated": mutated,
+            "tests_green": tests_green,
+            "validation_green": validation_green,
+        }
+
+    @staticmethod
+    def _execution_contract_violation_reason(
+        contract: dict[str, Any],
+        activity: dict[str, Any],
+    ) -> str:
+        if not isinstance(contract, dict) or not isinstance(activity, dict):
+            return ""
+        mode = str(contract.get("mode", "")).strip().lower()
+        tool_budget = int(contract.get("tool_budget", 0) or 0)
+        total = int(activity.get("total", 0) or 0)
+        search_count = int(activity.get("search_count", 0) or 0)
+        read_count = int(activity.get("read_count", 0) or 0)
+        edit_count = int(activity.get("edit_count", 0) or 0)
+        duplicate_reads = int(activity.get("duplicate_reads", 0) or 0)
+        tests_green = bool(activity.get("tests_green", False))
+        if contract.get("require_search_before_read", False) and read_count > 0 and search_count <= 0:
+            return "read_file used without a prior search or lookup"
+        if duplicate_reads > 0:
+            return "re-read the same file during one step"
+        if tool_budget > 0 and total > tool_budget and not tests_green:
+            return f"step exceeded tool budget ({total}>{tool_budget})"
+        if mode == "single_target_test_debug" and read_count > 1 and edit_count <= 0 and not tests_green:
+            return "single-target failure kept reading without patching"
+        return ""
+
+    def _print_autonomous_step_audit(
+        self,
+        contract: dict[str, Any],
+        activity: dict[str, Any],
+        violation_reason: str = "",
+    ) -> None:
+        budget = int(contract.get("tool_budget", 0) or 0)
+        budget_text = str(budget) if budget > 0 else "-"
+        followed = "no" if violation_reason else "yes"
+        print(
+            "[auto] audit: "
+            f"mode={str(contract.get('mode', 'general')).strip() or 'general'}, "
+            f"tools={int(activity.get('total', 0) or 0)}/{budget_text}, "
+            f"searches={int(activity.get('search_count', 0) or 0)}, "
+            f"reads={int(activity.get('read_count', 0) or 0)}, "
+            f"edits={int(activity.get('edit_count', 0) or 0)}, "
+            f"validations={int(activity.get('validation_count', 0) or 0)}, "
+            f"duplicate_reads={int(activity.get('duplicate_reads', 0) or 0)}, "
+            f"followed_contract={followed}"
+        )
+        if violation_reason:
+            print(f"[auto] contract issue: {violation_reason}")
+
+    def _tool_round_limit_for_contract(self, contract: dict[str, Any]) -> int:
+        tool_budget = (
+            int(contract.get("tool_budget", 0) or 0)
+            if isinstance(contract, dict)
+            else 0
+        )
+        if tool_budget > 0 and tool_budget <= 4:
+            return min(self.max_tool_rounds, 2)
+        if tool_budget > 0:
+            return min(self.max_tool_rounds, 3)
+        return self.max_tool_rounds
+
+    def _objective_tests_green(
+        self,
+        objective: str,
+        tool_payloads: list[dict[str, Any]],
+        workspace_validation: dict[str, Any] | None = None,
+    ) -> bool:
+        if self._has_unrepaired_mutation_failure(tool_payloads):
+            return False
+        target_scope = self._infer_validation_test_args(objective, tool_payloads)
+        if isinstance(workspace_validation, dict) and workspace_validation.get("tests_passed", False):
+            validation_scope = str(workspace_validation.get("tests", {}).get("command", "")).strip()
+            if not target_scope:
+                return True
+            if target_scope in validation_scope:
+                return True
+        for payload in reversed(tool_payloads):
+            if not isinstance(payload, dict):
+                continue
+            tool_name = str(payload.get("tool", "")).strip()
+            result = payload.get("result", {})
+            args = payload.get("args", {})
+            if not isinstance(result, dict):
+                continue
+            if tool_name == "run_tests" and bool(result.get("tests_passed", False)):
+                if not target_scope:
+                    return True
+                command = str(result.get("command", "")).strip()
+                if target_scope and target_scope in command:
+                    return True
+            if tool_name == "execute_command" and bool(result.get("ok", False)):
+                if int(result.get("exit_code", 0) or 0) != 0:
+                    continue
+                if not isinstance(args, dict):
+                    args = {}
+                cmd = str(args.get("cmd", "") or result.get("cmd", "")).strip()
+                if "pytest" not in cmd:
+                    continue
+                inferred_scope = self._extract_pytest_scope_from_command(cmd)
+                if not target_scope or inferred_scope == target_scope:
+                    return True
+        return False
+
+    @staticmethod
+    def _has_unrepaired_mutation_failure(
+        tool_payloads: list[dict[str, Any]],
+    ) -> bool:
+        mutating_tools = {"edit_file", "create_file", "write_file", "delete_file"}
+        pending_failure = False
+        for payload in tool_payloads:
+            if not isinstance(payload, dict):
+                continue
+            tool_name = str(payload.get("tool", "")).strip()
+            if tool_name not in mutating_tools:
+                continue
+            result = payload.get("result", {})
+            ok = bool(isinstance(result, dict) and result.get("ok", False))
+            if ok:
+                pending_failure = False
+            else:
+                pending_failure = True
+        return pending_failure
+
     def _should_run_validation_tests(
         self, step: PlanStep, payloads: list[dict[str, Any]]
     ) -> bool:
@@ -4470,20 +5109,14 @@ class ChatEngine:
             "delete_file",
         }
         tool_names = set(self._tool_names_from_payloads(payloads))
-        action = step.action.lower()
-        return (
-            bool(tool_names.intersection(edit_markers))
-            or "edit" in action
-            or "refactor" in action
-            or "fix" in action
-            or "implement" in action
-        )
+        return bool(tool_names.intersection(edit_markers))
 
     def _maybe_validate_workspace_after_step(
         self,
         step: PlanStep,
         project_context: dict[str, Any],
         payloads: list[dict[str, Any]],
+        objective: str = "",
     ) -> dict[str, Any] | None:
         if not self.autonomous_validate_changes:
             return None
@@ -4499,7 +5132,7 @@ class ChatEngine:
         args = {
             "path": ".",
             "test_runner": runner,
-            "test_args": "",
+            "test_args": self._infer_validation_test_args(objective, payloads),
             "timeout": 180,
             "focus_paths": self._focus_paths_from_payloads(payloads),
         }
@@ -4537,6 +5170,43 @@ class ChatEngine:
             marker in action
             for marker in ("fix", "edit", "write", "implement", "refactor", "patch")
         ) or self._should_run_validation_tests(step, [])
+
+    def _has_single_target_test_failure(
+        self,
+        workspace_validation: dict[str, Any] | None,
+        tool_payloads: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        signals = self._workspace_validation_signals(workspace_validation)
+        failed_tests = int(signals.get("failed_tests", 0) or 0)
+        test_errors = int(signals.get("test_errors", 0) or 0)
+        failures = signals.get("test_failures", [])
+        if (
+            isinstance(failures, list)
+            and len(failures) == 1
+            and (failed_tests + test_errors) <= 1
+        ):
+            nodeid = str(failures[0].get("nodeid", "")).strip() if isinstance(failures[0], dict) else ""
+            if nodeid.count("::") >= 1:
+                return True
+        for payload in tool_payloads or []:
+            if not isinstance(payload, dict) or str(payload.get("tool", "")).strip() != "run_tests":
+                continue
+            result = payload.get("result", {})
+            if not isinstance(result, dict) or bool(result.get("tests_passed", False)):
+                continue
+            failures = result.get("test_failures", [])
+            if not isinstance(failures, list) or len(failures) != 1:
+                continue
+            failed_tests = int(result.get("failed", 0) or 0)
+            test_errors = int(result.get("errors", 0) or 0)
+            nodeid = (
+                str(failures[0].get("nodeid", "")).strip()
+                if isinstance(failures[0], dict)
+                else ""
+            )
+            if (failed_tests + test_errors) <= 1 and nodeid.count("::") >= 1:
+                return True
+        return False
 
     @staticmethod
     def _render_test_failure_context(
@@ -4597,7 +5267,9 @@ class ChatEngine:
 
     @staticmethod
     def _repair_outcome_label(
-        before: dict[str, Any], after: dict[str, Any]
+        before: dict[str, Any],
+        after: dict[str, Any],
+        resolution_context: ResolutionContext | None = None,
     ) -> str:
         before_total = int(before.get("failed_tests", 0) or 0) + int(
             before.get("test_errors", 0) or 0
@@ -4605,7 +5277,10 @@ class ChatEngine:
         after_total = int(after.get("failed_tests", 0) or 0) + int(
             after.get("test_errors", 0) or 0
         )
-        if bool(after.get("tests_passed", False)):
+        if (
+            isinstance(resolution_context, ResolutionContext)
+            and resolution_succeeded(resolution_context)
+        ) or bool(after.get("tests_passed", False)):
             return "resolved"
         if after_total < before_total:
             return "improved"
@@ -4700,11 +5375,37 @@ class ChatEngine:
             if not isinstance(payload, dict):
                 continue
             result = payload.get("result", {})
-            if not isinstance(result, dict) or result.get("ok", False):
-                continue
             tool = str(payload.get("tool", "")).strip() or str(
                 payload.get("name", "")
             ).strip()
+            if (
+                tool == "run_tests"
+                and isinstance(result, dict)
+                and not bool(result.get("tests_passed", False))
+            ):
+                failures = result.get("test_failures", [])
+                if isinstance(failures, list):
+                    for item in failures[:6]:
+                        if not isinstance(item, dict):
+                            continue
+                        summary = str(item.get("summary", "")).strip()
+                        message = str(item.get("message", "")).strip()
+                        nodeid = str(item.get("nodeid", "")).strip()
+                        if summary:
+                            lines.append(summary)
+                        elif nodeid and message:
+                            lines.append(f"{nodeid}: {message}")
+                        elif message:
+                            lines.append(message)
+                stderr = str(result.get("stderr", "")).strip()
+                stdout = str(result.get("stdout", "")).strip()
+                if stderr:
+                    lines.append(stderr[:500])
+                elif stdout:
+                    lines.append(stdout[:400])
+                continue
+            if not isinstance(result, dict) or result.get("ok", False):
+                continue
             error = str(result.get("error", "")).strip()
             stderr = str(result.get("stderr", "")).strip()
             stdout = str(result.get("stdout", "")).strip()
@@ -4751,6 +5452,600 @@ class ChatEngine:
         if any(token in lowered for token in ("div", "quotient", "divide")):
             return "/"
         return None
+
+    @staticmethod
+    def _non_test_search_matches(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        filtered: list[dict[str, Any]] = []
+        for item in matches:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path", "")).strip().lower()
+            if not path:
+                continue
+            if "/test" in path or path.startswith("test") or path.endswith("_test.py"):
+                continue
+            filtered.append(item)
+        return filtered
+
+    def _repair_pattern_store(self) -> Any | None:
+        store = self._strategy_memory_store()
+        if store is None:
+            return None
+        if (
+            hasattr(store, "match_repair_pattern")
+            or hasattr(store, "find_repair_patterns")
+            or hasattr(store, "record_repair_pattern")
+        ):
+            return store
+        return None
+
+    @staticmethod
+    def _command_resolution_category(command: str) -> str:
+        lowered = str(command or "").strip().lower()
+        if not lowered:
+            return ""
+        if any(
+            token in lowered
+            for token in ("pytest", "unittest", "go test", "cargo test", "npm test")
+        ):
+            return "test"
+        if any(
+            token in lowered
+            for token in (
+                " lint",
+                "lint ",
+                "ruff",
+                "flake8",
+                "eslint",
+                "pylint",
+                "mypy",
+                "black --check",
+            )
+        ):
+            return "lint"
+        if any(
+            token in lowered
+            for token in (
+                " build",
+                "build ",
+                "compile",
+                "bundle",
+                "npm run build",
+                "cargo build",
+                "go build",
+                "make build",
+            )
+        ):
+            return "build"
+        return ""
+
+    @classmethod
+    def _build_resolution_context(
+        cls,
+        workspace_validation: dict[str, Any] | None = None,
+        tool_payloads: list[dict[str, Any]] | None = None,
+    ) -> ResolutionContext:
+        context = ResolutionContext()
+        latest_exit_code: int | None = None
+
+        def _capture_payload_result(payload: dict[str, Any]) -> None:
+            nonlocal latest_exit_code
+            tool_name = str(payload.get("tool", "")).strip()
+            result = payload.get("result", {})
+            args = payload.get("args", {})
+            if not isinstance(result, dict):
+                return
+            if tool_name == "run_tests":
+                context.tests_passed = bool(context.tests_passed or result.get("tests_passed", False))
+                exit_code = result.get("exit_code")
+                if isinstance(exit_code, int):
+                    latest_exit_code = exit_code
+            elif tool_name == "execute_command":
+                exit_code = result.get("exit_code")
+                if isinstance(exit_code, int):
+                    latest_exit_code = exit_code
+                cmd = ""
+                if isinstance(args, dict):
+                    cmd = str(args.get("cmd", "")).strip()
+                if not cmd:
+                    cmd = str(result.get("cmd", "")).strip()
+                category = cls._command_resolution_category(cmd)
+                if category == "build" and exit_code == 0:
+                    context.build_passed = True
+                elif category == "lint" and exit_code == 0:
+                    context.lint_passed = True
+            context.output_valid = bool(
+                context.output_valid
+                or result.get("output_valid", False)
+                or result.get("valid", False)
+            )
+            context.user_confirmed = bool(
+                context.user_confirmed or result.get("user_confirmed", False)
+            )
+
+        for payload in tool_payloads or []:
+            if isinstance(payload, dict):
+                _capture_payload_result(payload)
+
+        if isinstance(workspace_validation, dict):
+            context.tests_passed = bool(
+                context.tests_passed or workspace_validation.get("tests_passed", False)
+            )
+            context.output_valid = bool(
+                context.output_valid
+                or workspace_validation.get("output_valid", False)
+            )
+            context.user_confirmed = bool(
+                context.user_confirmed or workspace_validation.get("user_confirmed", False)
+            )
+            validation_signals = workspace_validation.get("validation_signals", {})
+            if isinstance(validation_signals, dict):
+                context.tests_passed = bool(
+                    context.tests_passed or validation_signals.get("tests_passed", False)
+                )
+                context.build_passed = bool(
+                    context.build_passed or validation_signals.get("build_passed", False)
+                )
+                context.lint_passed = bool(
+                    context.lint_passed or validation_signals.get("lint_passed", False)
+                )
+                context.output_valid = bool(
+                    context.output_valid or validation_signals.get("output_valid", False)
+                )
+                context.user_confirmed = bool(
+                    context.user_confirmed or validation_signals.get("user_confirmed", False)
+                )
+                exit_code = validation_signals.get("test_exit_code")
+                if isinstance(exit_code, int):
+                    latest_exit_code = exit_code
+            tests = workspace_validation.get("tests", {})
+            if isinstance(tests, dict):
+                exit_code = tests.get("exit_code")
+                if isinstance(exit_code, int):
+                    latest_exit_code = exit_code
+
+        context.command_exit_code = latest_exit_code
+        return context
+
+    @classmethod
+    def _simple_repair_context(cls, function_name: str) -> str:
+        if cls._operator_hint_from_name(function_name):
+            return "simple arithmetic function"
+        return "simple return expression"
+
+    @staticmethod
+    def _render_simple_operator_replacement(return_line: dict[str, str], operator: str) -> str:
+        return (
+            f"{return_line['indent']}return {return_line['left']} "
+            f"{operator} {return_line['right']}{return_line['suffix']}"
+        )
+
+    def _record_simple_repair_pattern(
+        self,
+        *,
+        function_name: str,
+        before: str,
+        after: str,
+        confidence: float,
+        source: str,
+    ) -> None:
+        store = self._repair_pattern_store()
+        if store is None or not hasattr(store, "record_repair_pattern"):
+            return
+        try:
+            store.record_repair_pattern(
+                pattern="operator mismatch",
+                before=before,
+                after=after,
+                context=self._simple_repair_context(function_name),
+                confidence=max(0.0, min(float(confidence), 1.0)),
+                function_name=function_name,
+                source=source,
+            )
+        except Exception:
+            pass
+
+    def _maybe_record_repair_pattern_from_payloads(
+        self,
+        repair_payloads: list[dict[str, Any]],
+        confidence: float,
+        source: str,
+    ) -> None:
+        for payload in repair_payloads:
+            if not isinstance(payload, dict) or str(payload.get("tool", "")).strip() != "edit_file":
+                continue
+            result = payload.get("result", {})
+            args = payload.get("args", {})
+            if not (isinstance(result, dict) and result.get("ok", False) and isinstance(args, dict)):
+                continue
+            before = str(args.get("find_text", "")).strip()
+            after = str(args.get("replace_text", "")).strip()
+            if not before or not after or before == after:
+                continue
+            before_line = self._find_simple_return_line(f"def _tmp():\n    {before}", "_tmp")
+            after_line = self._find_simple_return_line(f"def _tmp():\n    {after}", "_tmp")
+            if before_line is None or after_line is None:
+                continue
+            if (
+                before_line.get("left") != after_line.get("left")
+                or before_line.get("right") != after_line.get("right")
+                or before_line.get("operator") == after_line.get("operator")
+            ):
+                continue
+            self._record_simple_repair_pattern(
+                function_name="",
+                before=before,
+                after=after,
+                confidence=confidence,
+                source=source,
+            )
+            break
+
+    def _find_simple_operator_mismatch_candidate(
+        self,
+        objective: str,
+        workspace_validation: dict[str, Any] | None,
+        current_tool_payloads: list[dict[str, Any]],
+        auto_metrics: dict[str, Any],
+        allow_tool_lookup: bool = True,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        supplemental_payloads: list[dict[str, Any]] = []
+        read_cache = {
+            item["path"]: item["content"]
+            for item in self._collect_read_results_from_payloads(current_tool_payloads)
+        }
+        search_root = self._infer_search_root_from_test_scope(
+            self._infer_validation_test_args(objective, current_tool_payloads)
+        )
+        if search_root == ".":
+            search_root = self._infer_search_root_from_test_scope(
+                self._infer_pytest_scope_from_objective(objective)
+            )
+
+        failure_text = self._extract_root_cause_error_text(
+            workspace_validation,
+            tool_payloads=current_tool_payloads,
+        ).lower()
+        if not failure_text or "assert" not in failure_text:
+            return None, supplemental_payloads
+
+        patch_candidate: dict[str, Any] | None = None
+        for symbol in self._extract_failure_anchor_symbols(
+            workspace_validation,
+            current_tool_payloads,
+        ):
+            expected_operator = self._operator_hint_from_name(symbol)
+            if not expected_operator:
+                continue
+            cached_paths: list[str] = []
+            for path, content in read_cache.items():
+                if re.search(
+                    rf"^[ \t]*def\s+{re.escape(symbol)}\s*\(",
+                    content,
+                    flags=re.MULTILINE,
+                ):
+                    cached_paths.append(path)
+            for path, content in read_cache.items():
+                imported_paths = self._extract_imported_function_paths(content)
+                imported_path = str(imported_paths.get(symbol, "")).strip()
+                if imported_path and imported_path in read_cache and imported_path not in cached_paths:
+                    cached_paths.append(imported_path)
+            if len(cached_paths) == 1:
+                source_path = cached_paths[0]
+                source_content = read_cache.get(source_path, "")
+                return_line = self._find_simple_return_line(source_content, symbol)
+                if return_line is not None:
+                    current_operator = str(return_line.get("operator", "")).strip()
+                    if current_operator and current_operator != expected_operator:
+                        patch_candidate = {
+                            "path": source_path,
+                            "find_text": return_line["line"],
+                            "replace_text": self._render_simple_operator_replacement(
+                                return_line,
+                                expected_operator,
+                            ),
+                            "function_name": symbol,
+                            "context": self._simple_repair_context(symbol),
+                            "expected_operator": expected_operator,
+                            "current_operator": current_operator,
+                            "return_line": return_line,
+                        }
+                        break
+            if not allow_tool_lookup:
+                continue
+            search_payload = self._execute_internal_autonomous_tool(
+                "search_project",
+                {
+                    "query": f"def {symbol}(",
+                    "path": search_root,
+                    "glob": "**/*.py",
+                    "case_sensitive": True,
+                    "max_matches": 5,
+                },
+                source="immediate_fix_search",
+            )
+            supplemental_payloads.append(search_payload)
+            auto_metrics["tool_calls"] = int(auto_metrics.get("tool_calls", 0) or 0) + 1
+            search_result = search_payload.get("result", {})
+            if not (isinstance(search_result, dict) and search_result.get("ok", False)):
+                auto_metrics["failed_tool_calls"] = int(
+                    auto_metrics.get("failed_tool_calls", 0) or 0
+                ) + 1
+                continue
+            matches = self._non_test_search_matches(
+                search_result.get("matches", [])
+                if isinstance(search_result.get("matches", []), list)
+                else []
+            )
+            if len(matches) != 1:
+                continue
+            match = matches[0]
+            source_path = str(match.get("path", "")).strip()
+            try:
+                anchor_line = int(match.get("line", 0) or 0)
+            except Exception:
+                anchor_line = 0
+            if not source_path or anchor_line <= 0:
+                continue
+
+            source_content = read_cache.get(source_path, "")
+            if not source_content:
+                read_args = self._read_window_args(source_path, anchor_line)
+                read_payload = self._execute_internal_autonomous_tool(
+                    "read_file",
+                    read_args,
+                    source="immediate_fix_context",
+                )
+                supplemental_payloads.append(read_payload)
+                auto_metrics["tool_calls"] = int(auto_metrics.get("tool_calls", 0) or 0) + 1
+                read_result = read_payload.get("result", {})
+                if not (isinstance(read_result, dict) and read_result.get("ok", False)):
+                    auto_metrics["failed_tool_calls"] = int(
+                        auto_metrics.get("failed_tool_calls", 0) or 0
+                    ) + 1
+                    continue
+                source_content = str(read_result.get("content", "")).strip()
+                if source_content:
+                    read_cache[source_path] = source_content
+            if not source_content:
+                continue
+            return_line = self._find_simple_return_line(source_content, symbol)
+            if return_line is None:
+                continue
+            current_operator = str(return_line.get("operator", "")).strip()
+            if not current_operator or current_operator == expected_operator:
+                continue
+            patch_candidate = {
+                "path": source_path,
+                "find_text": return_line["line"],
+                "replace_text": self._render_simple_operator_replacement(
+                    return_line,
+                    expected_operator,
+                ),
+                "function_name": symbol,
+                "context": self._simple_repair_context(symbol),
+                "expected_operator": expected_operator,
+                "current_operator": current_operator,
+                "return_line": return_line,
+            }
+            break
+        return patch_candidate, supplemental_payloads
+
+    def _apply_simple_repair_candidate(
+        self,
+        *,
+        candidate: dict[str, Any],
+        objective: str,
+        step: PlanStep,
+        project_context: dict[str, Any],
+        workspace_validation: dict[str, Any] | None,
+        auto_metrics: dict[str, Any],
+        source: str,
+        history_kind: str,
+        history_label: str,
+        record_pattern: bool,
+    ) -> tuple[bool, list[dict[str, Any]], dict[str, Any] | None, dict[str, Any]]:
+        args = {
+            "path": candidate["path"],
+            "find_text": candidate["find_text"],
+            "replace_text": candidate["replace_text"],
+        }
+        payload = self._execute_internal_autonomous_tool(
+            "edit_file",
+            args,
+            source=source,
+        )
+        result = payload.get("result", {})
+        auto_metrics["tool_calls"] = int(auto_metrics.get("tool_calls", 0) or 0) + 1
+        if not (isinstance(result, dict) and result.get("ok", False)):
+            auto_metrics["failed_tool_calls"] = int(
+                auto_metrics.get("failed_tool_calls", 0) or 0
+            ) + 1
+            history_item = {
+                "attempt": 0,
+                "kind": history_kind,
+                "hypothesis": history_label,
+                "result": "failed",
+                "outcome": "unchanged",
+                "fix_signature": self._repair_fix_signature([payload]),
+            }
+            return False, [payload], workspace_validation, history_item
+
+        updated_validation = self._maybe_validate_workspace_after_step(
+            step=step,
+            project_context=project_context,
+            payloads=[payload],
+            objective=objective,
+        )
+        resolution_context = self._build_resolution_context(
+            workspace_validation=updated_validation,
+            tool_payloads=[payload],
+        )
+        solved = resolution_succeeded(resolution_context)
+        confidence = compute_confidence(resolution_context)
+        if solved and record_pattern and confidence >= 0.8:
+            self._record_simple_repair_pattern(
+                function_name=str(candidate.get("function_name", "")).strip(),
+                before=str(candidate.get("find_text", "")).strip(),
+                after=str(candidate.get("replace_text", "")).strip(),
+                confidence=confidence,
+                source=source,
+            )
+        history_item = {
+            "attempt": 0,
+            "kind": history_kind,
+            "hypothesis": history_label,
+            "result": "success" if solved else "failed",
+            "outcome": "resolved" if solved else "unchanged",
+            "fix_signature": self._repair_fix_signature([payload]),
+            "confidence": confidence,
+        }
+        return solved, [payload], updated_validation, history_item
+
+    def _maybe_apply_learned_repair_pattern(
+        self,
+        objective: str,
+        step: PlanStep,
+        workspace_validation: dict[str, Any] | None,
+        current_tool_payloads: list[dict[str, Any]],
+        project_context: dict[str, Any],
+        auto_metrics: dict[str, Any],
+    ) -> tuple[bool, list[dict[str, Any]], dict[str, Any] | None, dict[str, Any] | None]:
+        store = self._repair_pattern_store()
+        if store is None or not hasattr(store, "match_repair_pattern"):
+            return False, [], workspace_validation, None
+        candidate, supplemental_payloads = self._find_simple_operator_mismatch_candidate(
+            objective=objective,
+            workspace_validation=workspace_validation,
+            current_tool_payloads=current_tool_payloads,
+            auto_metrics=auto_metrics,
+            allow_tool_lookup=False,
+        )
+        if candidate is None:
+            return False, supplemental_payloads, workspace_validation, None
+        failure_signature = {
+            "pattern": "operator mismatch",
+            "function_name": str(candidate.get("function_name", "")).strip(),
+            "before": str(candidate.get("find_text", "")).strip(),
+            "context": str(candidate.get("context", "")).strip(),
+        }
+        try:
+            matches = store.match_repair_pattern(failure_signature, limit=1)
+        except Exception:
+            return False, supplemental_payloads, workspace_validation, None
+        if not isinstance(matches, list) or not matches:
+            return False, supplemental_payloads, workspace_validation, None
+        selected = matches[0]
+        match_score = float(selected.get("score", 0.0) or 0.0)
+        if match_score < 0.8:
+            return False, supplemental_payloads, workspace_validation, None
+        learned_after = str(selected.get("after", "")).strip()
+        learned_operator = self._find_simple_return_line(
+            f"def _tmp():\n    {learned_after.strip()}",
+            "_tmp",
+        )
+        if learned_operator is not None:
+            operator = str(learned_operator.get("operator", "")).strip()
+            if operator and operator != str(candidate.get("current_operator", "")).strip():
+                candidate = dict(candidate)
+                candidate["replace_text"] = self._render_simple_operator_replacement(
+                    candidate["return_line"],
+                    operator,
+                )
+        print(
+            "[auto] learned repair pattern: "
+            f"pattern='operator mismatch', score={match_score:.2f}, "
+            f"function={str(candidate.get('function_name', '')).strip() or '?'}"
+        )
+        solved, payloads, updated_validation, history_item = self._apply_simple_repair_candidate(
+            candidate=candidate,
+            objective=objective,
+            step=PlanStep(step_id=0, action="apply learned repair pattern"),
+            project_context=project_context,
+            workspace_validation=workspace_validation,
+            auto_metrics=auto_metrics,
+            source="repair_pattern",
+            history_kind="repair_pattern",
+            history_label=(
+                "apply learned operator mismatch repair in "
+                f"{str(candidate.get('function_name', '')).strip() or 'function'}"
+            ),
+            record_pattern=True,
+        )
+        return solved, supplemental_payloads + payloads, updated_validation, history_item
+
+    @staticmethod
+    def _candidate_symbol_names(raw: str) -> list[str]:
+        text = str(raw or "").strip()
+        if not text:
+            return []
+        text = text.split("[", 1)[0].strip()
+        candidates: list[str] = []
+        seen = set()
+        direct = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", text)
+        for name in direct:
+            if name in {"assert", "self", "pytest"}:
+                continue
+            if name not in seen:
+                candidates.append(name)
+                seen.add(name)
+        if text.startswith("test_"):
+            derived = text[5:].strip("_")
+            if derived and derived not in seen:
+                candidates.insert(0, derived)
+                seen.add(derived)
+        return candidates
+
+    def _extract_failure_anchor_symbols(
+        self,
+        workspace_validation: dict[str, Any] | None,
+        tool_payloads: list[dict[str, Any]],
+    ) -> list[str]:
+        seen = set()
+        symbols: list[str] = []
+
+        def _add(raw: str) -> None:
+            for name in self._candidate_symbol_names(raw):
+                if name not in seen:
+                    symbols.append(name)
+                    seen.add(name)
+
+        signals = self._workspace_validation_signals(workspace_validation)
+        failures = signals.get("test_failures", [])
+        if isinstance(failures, list):
+            for item in failures[:4]:
+                if not isinstance(item, dict):
+                    continue
+                _add(str(item.get("nodeid", "")).split("::")[-1])
+                _add(str(item.get("message", "")))
+                _add(str(item.get("summary", "")))
+
+        for payload in tool_payloads:
+            if not isinstance(payload, dict) or str(payload.get("tool", "")).strip() != "run_tests":
+                continue
+            result = payload.get("result", {})
+            if not isinstance(result, dict) or bool(result.get("tests_passed", False)):
+                continue
+            failures = result.get("test_failures", [])
+            if not isinstance(failures, list):
+                continue
+            for item in failures[:4]:
+                if not isinstance(item, dict):
+                    continue
+                _add(str(item.get("nodeid", "")).split("::")[-1])
+                _add(str(item.get("message", "")))
+                _add(str(item.get("summary", "")))
+        return symbols
+
+    @staticmethod
+    def _read_window_args(path: str, line: int, radius: int = 20) -> dict[str, Any]:
+        anchor = max(1, int(line or 1))
+        return {
+            "path": path,
+            "start_line": max(1, anchor - radius),
+            "end_line": anchor + radius,
+            "max_chars": 4000,
+        }
 
     @classmethod
     def _extract_imported_function_paths(cls, test_content: str) -> dict[str, str]:
@@ -4816,8 +6111,114 @@ class ChatEngine:
                 }
         return None
 
+    @staticmethod
+    def _collect_read_results_from_payloads(
+        payloads: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        read_results: list[dict[str, str]] = []
+        seen_paths = set()
+        for payload in payloads:
+            if not isinstance(payload, dict) or str(payload.get("tool", "")).strip() != "read_file":
+                continue
+            result = payload.get("result", {})
+            args = payload.get("args", {})
+            if not isinstance(result, dict) or not result.get("ok", False):
+                continue
+            path = str(result.get("path", "") or (args.get("path", "") if isinstance(args, dict) else "")).strip()
+            content = str(result.get("content", "")).strip()
+            if not path or not content or path in seen_paths:
+                continue
+            read_results.append({"path": path, "content": content})
+            seen_paths.add(path)
+        return read_results
+
+    def _supplement_simple_pytest_context_reads(
+        self,
+        current_tool_payloads: list[dict[str, Any]],
+        auto_metrics: dict[str, Any],
+        read_cache: dict[str, str] | None = None,
+    ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+        supplemental_reads: list[dict[str, str]] = []
+        supplemental_payloads: list[dict[str, Any]] = []
+        cached_reads = {
+            str(path).strip(): str(content).strip()
+            for path, content in (read_cache or {}).items()
+            if str(path).strip() and str(content).strip()
+        }
+        returned_paths = set()
+
+        def _append_cached(path: str) -> None:
+            content = cached_reads.get(path, "")
+            if not content or path in returned_paths:
+                return
+            supplemental_reads.append({"path": path, "content": content})
+            returned_paths.add(path)
+
+        def _read_path(path: str) -> None:
+            clean_path = str(path or "").strip()
+            if not clean_path:
+                return
+            if clean_path in cached_reads:
+                _append_cached(clean_path)
+                return
+            payload = self._execute_internal_autonomous_tool(
+                "read_file",
+                {"path": clean_path},
+                source="immediate_fix_context",
+            )
+            result = payload.get("result", {})
+            supplemental_payloads.append(payload)
+            auto_metrics["tool_calls"] = int(auto_metrics.get("tool_calls", 0) or 0) + 1
+            if not (isinstance(result, dict) and result.get("ok", False)):
+                auto_metrics["failed_tool_calls"] = int(
+                    auto_metrics.get("failed_tool_calls", 0) or 0
+                ) + 1
+                return
+            content = str(result.get("content", "")).strip()
+            if content:
+                cached_reads[clean_path] = content
+                _append_cached(clean_path)
+
+        for payload in current_tool_payloads:
+            if not isinstance(payload, dict) or str(payload.get("tool", "")).strip() != "run_tests":
+                continue
+            result = payload.get("result", {})
+            args = payload.get("args", {})
+            if not isinstance(result, dict) or bool(result.get("tests_passed", False)):
+                continue
+            failures = result.get("test_failures", [])
+            if not isinstance(failures, list) or not failures:
+                continue
+            tests_root = ""
+            if isinstance(args, dict):
+                tests_root = str(args.get("path", "")).strip()
+            if not tests_root:
+                tests_root = str(result.get("path", "")).strip()
+            nodeid = str(failures[0].get("nodeid", "")).strip()
+            if not nodeid:
+                continue
+            test_node = nodeid.split("::", 1)[0].strip()
+            if not test_node:
+                continue
+            if tests_root and not test_node.startswith(tests_root):
+                test_path = f"{tests_root.rstrip('/')}/{test_node.lstrip('./')}"
+            else:
+                test_path = test_node
+            _read_path(test_path)
+            if not supplemental_reads:
+                continue
+            imported_paths = self._extract_imported_function_paths(
+                supplemental_reads[-1]["content"]
+            )
+            for source_path in imported_paths.values():
+                _read_path(source_path)
+            if supplemental_reads:
+                break
+        return supplemental_reads, supplemental_payloads
+
     def _maybe_apply_immediate_fix_from_observation(
         self,
+        objective: str,
         step: PlanStep,
         workspace_validation: dict[str, Any] | None,
         current_tool_payloads: list[dict[str, Any]],
@@ -4825,144 +6226,36 @@ class ChatEngine:
         auto_metrics: dict[str, Any],
     ) -> tuple[bool, list[dict[str, Any]], dict[str, Any] | None, dict[str, Any] | None]:
         del step
-        read_results: list[dict[str, str]] = []
-        for payload in current_tool_payloads:
-            if not isinstance(payload, dict) or str(payload.get("tool", "")).strip() != "read_file":
-                continue
-            result = payload.get("result", {})
-            if not isinstance(result, dict) or not result.get("ok", False):
-                continue
-            path = str(result.get("path", "") or payload.get("args", {}).get("path", "")).strip()
-            content = str(result.get("content", "")).strip()
-            if path and content:
-                read_results.append({"path": path, "content": content})
-        if not read_results:
-            return False, [], workspace_validation, None
+        candidate, supplemental_payloads = self._find_simple_operator_mismatch_candidate(
+            objective=objective,
+            workspace_validation=workspace_validation,
+            current_tool_payloads=current_tool_payloads,
+            auto_metrics=auto_metrics,
+        )
+        if candidate is None:
+            return False, supplemental_payloads, workspace_validation, None
 
-        failure_text = self._extract_root_cause_error_text(
-            workspace_validation,
-            tool_payloads=current_tool_payloads,
-        ).lower()
-        if not failure_text or "assert" not in failure_text:
-            return False, [], workspace_validation, None
-
-        failure_nodeids: list[str] = []
-        signals = self._workspace_validation_signals(workspace_validation)
-        raw_failures = signals.get("test_failures", [])
-        if isinstance(raw_failures, list):
-            for item in raw_failures:
-                if not isinstance(item, dict):
-                    continue
-                nodeid = str(item.get("nodeid", "")).strip()
-                if nodeid:
-                    failure_nodeids.append(nodeid)
-
-        candidate_tests: list[dict[str, str]] = []
-        for item in read_results:
-            path = item["path"]
-            if "/test" in path or path.startswith("test") or "assert " in item["content"]:
-                if not failure_nodeids or any(nodeid.startswith(path) for nodeid in failure_nodeids):
-                    candidate_tests.append(item)
-        if not candidate_tests:
-            candidate_tests = [item for item in read_results if "assert " in item["content"]]
-        candidate_sources = [
-            item
-            for item in read_results
-            if item not in candidate_tests and not ("/test" in item["path"] or item["path"].startswith("test"))
-        ]
-        if not candidate_tests or not candidate_sources:
-            return False, [], workspace_validation, None
-
-        patch_candidates: list[dict[str, Any]] = []
-        for test_item in candidate_tests:
-            imported_paths = self._extract_imported_function_paths(test_item["content"])
-            for func_name in self._extract_test_assert_targets(test_item["content"]):
-                expected_operator = self._operator_hint_from_name(func_name)
-                if not expected_operator:
-                    continue
-                preferred_path = imported_paths.get(func_name, "")
-                source_pool = candidate_sources
-                if preferred_path:
-                    source_pool = [
-                        item for item in candidate_sources if item["path"].endswith(preferred_path)
-                    ] or source_pool
-                for source_item in source_pool:
-                    return_line = self._find_simple_return_line(
-                        source_item["content"], func_name
-                    )
-                    if return_line is None:
-                        continue
-                    current_operator = str(return_line.get("operator", "")).strip()
-                    if not current_operator or current_operator == expected_operator:
-                        continue
-                    replacement = (
-                        f"{return_line['indent']}return {return_line['left']} "
-                        f"{expected_operator} {return_line['right']}{return_line['suffix']}"
-                    )
-                    patch_candidates.append(
-                        {
-                            "path": source_item["path"],
-                            "find_text": return_line["line"],
-                            "replace_text": replacement,
-                            "function_name": func_name,
-                        }
-                    )
-
-        if len(patch_candidates) != 1:
-            return False, [], workspace_validation, None
-
-        candidate = patch_candidates[0]
         print(
             "[auto] immediate fix trigger: "
             f"{candidate['function_name']} operator mismatch in {candidate['path']}"
         )
-        args = {
-            "path": candidate["path"],
-            "find_text": candidate["find_text"],
-            "replace_text": candidate["replace_text"],
-        }
-        result = self.tools.execute("edit_file", args)
-        payload = {
-            "tool": "edit_file",
-            "args": args,
-            "result": result,
-            "source": "immediate_fix",
-        }
-        auto_metrics["tool_calls"] = int(auto_metrics.get("tool_calls", 0) or 0) + 1
-        if not (isinstance(result, dict) and result.get("ok", False)):
-            auto_metrics["failed_tool_calls"] = int(
-                auto_metrics.get("failed_tool_calls", 0) or 0
-            ) + 1
-            history_item = {
-                "attempt": 0,
-                "kind": "immediate_fix",
-                "hypothesis": f"fix operator mismatch in {candidate['function_name']}",
-                "result": "failed",
-                "outcome": "unchanged",
-                "fix_signature": self._repair_fix_signature([payload]),
-            }
-            return False, [payload], workspace_validation, history_item
-
-        updated_validation = self._maybe_validate_workspace_after_step(
+        solved, payloads, updated_validation, history_item = self._apply_simple_repair_candidate(
+            candidate=candidate,
+            objective=objective,
             step=PlanStep(step_id=0, action="apply immediate fix"),
             project_context=project_context,
-            payloads=[payload],
+            workspace_validation=workspace_validation,
+            auto_metrics=auto_metrics,
+            source="immediate_fix",
+            history_kind="immediate_fix",
+            history_label=f"fix operator mismatch in {candidate['function_name']}",
+            record_pattern=True,
         )
-        solved = bool(
-            self._workspace_validation_signals(updated_validation).get("tests_passed", False)
-        )
-        history_item = {
-            "attempt": 0,
-            "kind": "immediate_fix",
-            "hypothesis": f"fix operator mismatch in {candidate['function_name']}",
-            "result": "success" if solved else "failed",
-            "outcome": "resolved" if solved else "unchanged",
-            "fix_signature": self._repair_fix_signature([payload]),
-        }
-        return solved, [payload], updated_validation, history_item
+        return solved, supplemental_payloads + payloads, updated_validation, history_item
 
     def _maybe_apply_root_cause_fix(
         self,
+        objective: str,
         step: PlanStep,
         workspace_validation: dict[str, Any] | None,
         current_tool_payloads: list[dict[str, Any]],
@@ -5024,8 +6317,12 @@ class ChatEngine:
             if not tool_name or not isinstance(args, dict):
                 continue
             tool_name, args = self._normalize_root_cause_fix_call(tool_name, args)
-            result = self.tools.execute(tool_name, args)
-            payload = {"tool": tool_name, "args": args, "result": result, "source": "root_cause"}
+            payload = self._execute_internal_autonomous_tool(
+                tool_name,
+                args,
+                source="root_cause",
+            )
+            result = payload.get("result", {})
             root_payloads.append(payload)
             auto_metrics["tool_calls"] = int(auto_metrics.get("tool_calls", 0) or 0) + 1
             if not (isinstance(result, dict) and result.get("ok", False)):
@@ -5039,18 +6336,27 @@ class ChatEngine:
             step=step,
             project_context=project_context,
             payloads=root_payloads,
+            objective=objective,
         )
-        signals = self._workspace_validation_signals(updated_validation)
-        solved = bool(signals.get("tests_passed", False))
+        resolution_context = self._build_resolution_context(
+            workspace_validation=updated_validation,
+            tool_payloads=root_payloads,
+        )
+        solved = resolution_succeeded(resolution_context)
+        resolution_confidence = compute_confidence(resolution_context)
         confidence = float(selected.get("confidence", 0.5) or 0.5)
         if solved:
-            print("[auto] known root-cause fix solved failing tests")
+            print("[auto] known root-cause fix satisfied the resolution signal")
         if hasattr(store, "record_root_cause_feedback"):
             try:
                 store.record_root_cause_feedback(
                     root_cause_id=str(selected.get("id", "")),
                     success=bool(all_ok and solved),
-                    confidence=1.0 if solved else max(0.0, confidence * 0.6),
+                    confidence=(
+                        resolution_confidence
+                        if solved
+                        else max(0.0, confidence * 0.6)
+                    ),
                 )
             except Exception:
                 pass
@@ -5065,6 +6371,7 @@ class ChatEngine:
             "impact": "resolved" if solved else "no_change",
             "outcome": "resolved" if solved else "unchanged",
             "fix_signature": self._repair_fix_signature(root_payloads),
+            "resolution_confidence": resolution_confidence,
         }
         return solved, root_payloads, updated_validation, history_item
 
@@ -5249,6 +6556,13 @@ class ChatEngine:
         diff_excerpt = diff_excerpt[:1200] if diff_excerpt else ""
         hypothesis = hypothesis or {}
         history_text = self._render_repair_history(repair_history or [])
+        contract = self._build_autonomous_step_contract(
+            objective=objective,
+            step=step,
+            workspace_validation=workspace_validation,
+            tool_payloads=[],
+        )
+        contract_text = self._render_autonomous_step_contract(contract)
         return (
             "Autonomous repair mode enabled.\n"
             f"Objective: {objective}\n"
@@ -5265,6 +6579,8 @@ class ChatEngine:
             f"{history_text}\n"
             "Focus only on fixing the concrete failing tests using the workspace state.\n"
             "Use tools to inspect files, test your hypothesis, patch code, and rerun tests. Avoid unrelated refactors.\n"
+            "Return the next tool call immediately. Do not restate the plan. Do not explain reasoning before using tools.\n"
+            f"{contract_text}"
             "Failure summaries:\n"
             f"{failure_context or '- No structured failure summary available'}\n"
             + (
@@ -5291,8 +6607,27 @@ class ChatEngine:
         repair_state = RepairState()
         improving_fix_signatures: set[str] = set()
 
+        solved_by_pattern, pattern_payloads, validation, pattern_history = (
+            self._maybe_apply_learned_repair_pattern(
+                objective=objective,
+                step=step,
+                workspace_validation=validation,
+                current_tool_payloads=combined_payloads,
+                project_context=project_context,
+                auto_metrics=auto_metrics,
+            )
+        )
+        if pattern_payloads:
+            combined_payloads.extend(pattern_payloads)
+        if pattern_history:
+            repair_history.append(pattern_history)
+        if solved_by_pattern:
+            latest_text = "Applied a learned repair pattern from memory and the resolution signal is now green."
+            return latest_text, combined_payloads, validation, repair_history
+
         solved_immediately, immediate_payloads, validation, immediate_history = (
             self._maybe_apply_immediate_fix_from_observation(
+                objective=objective,
                 step=step,
                 workspace_validation=validation,
                 current_tool_payloads=combined_payloads,
@@ -5305,11 +6640,12 @@ class ChatEngine:
         if immediate_history:
             repair_history.append(immediate_history)
         if solved_immediately:
-            latest_text = "Applied an immediate deterministic fix from the observed failure and tests are now passing."
+            latest_text = "Applied an immediate deterministic fix from the observed failure and the resolution signal is now green."
             return latest_text, combined_payloads, validation, repair_history
 
         # Root-cause first-pass: deterministic fix templates before model-driven repair.
         solved_by_root_cause, root_payloads, validation, root_history = self._maybe_apply_root_cause_fix(
+            objective=objective,
             step=step,
             workspace_validation=validation,
             current_tool_payloads=combined_payloads,
@@ -5321,10 +6657,14 @@ class ChatEngine:
         if root_history:
             repair_history.append(root_history)
         if solved_by_root_cause:
-            latest_text = "Applied root-cause fix template and tests are now passing."
+            latest_text = "Applied root-cause fix template and the resolution signal is now green."
             return latest_text, combined_payloads, validation, repair_history
 
-        for attempt_no in range(self.autonomous_test_repair_attempts):
+        repair_attempt_cap = self.autonomous_test_repair_attempts
+        if self._has_single_target_test_failure(validation, combined_payloads):
+            repair_attempt_cap = min(repair_attempt_cap, 1)
+
+        for attempt_no in range(repair_attempt_cap):
             if not self._should_attempt_test_driven_repair(step, validation, attempt_no):
                 break
             repair_state.attempts += 1
@@ -5382,6 +6722,14 @@ class ChatEngine:
                 renderer.prepare_tool_output,
                 enforce_presearch=False,
                 log_interaction=False,
+                max_tool_rounds_override=self._tool_round_limit_for_contract(
+                    self._build_autonomous_step_contract(
+                        objective=objective,
+                        step=step,
+                        workspace_validation=validation,
+                        tool_payloads=combined_payloads,
+                    )
+                ),
             )
             renderer.finish()
             latest_text = extract_answer_text(response).strip()
@@ -5424,12 +6772,23 @@ class ChatEngine:
                 step=step,
                 project_context=project_context,
                 payloads=repair_payloads,
+                objective=objective,
             )
             after_snapshot = self._test_failure_snapshot(validation)
-            outcome = self._repair_outcome_label(before_snapshot, after_snapshot)
+            resolution_context = self._build_resolution_context(
+                workspace_validation=validation,
+                tool_payloads=repair_payloads,
+            )
+            resolution_ok = resolution_succeeded(resolution_context)
+            resolution_confidence = compute_confidence(resolution_context)
+            outcome = self._repair_outcome_label(
+                before_snapshot,
+                after_snapshot,
+                resolution_context=resolution_context,
+            )
             result_label = (
                 "success"
-                if bool(after_snapshot.get("tests_passed", False))
+                if resolution_ok
                 else "failed"
             )
             impact_label = (
@@ -5455,19 +6814,25 @@ class ChatEngine:
                     + int(after_snapshot.get("test_errors", 0) or 0),
                     "outcome": outcome,
                     "fix_signature": fix_signature,
+                    "resolution_confidence": resolution_confidence,
                 }
             )
             if fix_signature and outcome in {"improved", "resolved"}:
                 improving_fix_signatures.add(fix_signature)
-            signals = self._workspace_validation_signals(validation)
-            if bool(signals.get("tests_passed", False)):
+            if resolution_ok and resolution_confidence >= 0.8:
+                self._maybe_record_repair_pattern_from_payloads(
+                    repair_payloads=repair_payloads,
+                    confidence=resolution_confidence,
+                    source="autonomous_repair",
+                )
                 self._maybe_record_learned_root_cause(
                     step=step,
                     project_context=project_context,
                     before_snapshot=before_snapshot,
                     repair_payloads=repair_payloads,
-                    confidence=float(hypothesis.get("confidence", 0.6) or 0.6),
+                    confidence=resolution_confidence,
                 )
+            if resolution_ok:
                 break
         return latest_text, combined_payloads, validation, repair_history
 

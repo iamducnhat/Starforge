@@ -40,24 +40,3 @@ pytest -q demo_project/tests
 ```
 
 Run the exact autonomous command again and record the speed/attempt delta.
-
-## Important Path Note
-
-If your agent prompt enforces edits inside ``, keep all objectives and pytest paths under `demo_project`. Using the old `demo_project/...` path can cause plan/validation loops.
-
-## Recording Notes
-
-Use these moments as scene cuts:
-
-1. Initial failing test output.
-2. `[auto] test-driven repair attempt ...`
-3. `[auto] hypothesis: ...`
-4. `[auto] recording root cause: ...`
-5. Second run with:
-   - `[auto] root-cause candidate: ...`
-   - `[auto] applying known fix template...`
-   - `[auto] known root-cause fix solved failing tests`
-
-## Suggested Title
-
-`I built an AI that debugs code and learns from its own mistakes`

@@ -288,6 +288,68 @@ class TestMemoryStore(unittest.TestCase):
         self.assertIn("missing dependency for package", imports)
         self.assertIn("AssertionError", tests)
 
+    def test_record_repair_pattern_persists_before_after_context(self):
+        result = self.store.record_repair_pattern(
+            pattern="operator mismatch",
+            before="return a - b",
+            after="return a + b",
+            context="simple arithmetic function",
+            confidence=0.95,
+            function_name="add",
+            source="test",
+        )
+        self.assertTrue(result["ok"])
+        payload = self.store.repair_patterns_path.read_text(encoding="utf-8")
+        self.assertIn('"pattern": "operator mismatch"', payload)
+        self.assertIn('"before": "return a - b"', payload)
+        self.assertIn('"after": "return a + b"', payload)
+        self.assertIn('"context": "simple arithmetic function"', payload)
+        self.assertIn('"function_name": "add"', payload)
+
+    def test_find_repair_patterns_matches_operator_change(self):
+        self.store.record_repair_pattern(
+            pattern="operator mismatch",
+            before="return a - b",
+            after="return a + b",
+            context="simple arithmetic function",
+            confidence=0.9,
+            function_name="add",
+            source="test",
+        )
+        matches = self.store.find_repair_patterns(
+            pattern="operator mismatch",
+            before="return x - y",
+            context="simple arithmetic function",
+            limit=1,
+        )
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["pattern"], "operator mismatch")
+        self.assertEqual(matches[0]["after"], "return a + b")
+        self.assertGreaterEqual(matches[0]["score"], 0.8)
+
+    def test_match_repair_pattern_uses_failure_signature(self):
+        self.store.record_repair_pattern(
+            pattern="operator mismatch",
+            before="return a - b",
+            after="return a + b",
+            context="simple arithmetic function",
+            confidence=0.9,
+            function_name="add",
+            source="test",
+        )
+        matches = self.store.match_repair_pattern(
+            {
+                "pattern": "operator mismatch",
+                "function_name": "add",
+                "before": "return left - right",
+                "context": "simple arithmetic function",
+            },
+            limit=1,
+        )
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["function_name"], "add")
+        self.assertGreaterEqual(matches[0]["score"], 0.8)
+
 
 if __name__ == "__main__":
     unittest.main()

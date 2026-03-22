@@ -6,18 +6,34 @@ An autonomous coding agent that learns from its own mistakes.
 
 ## Table of Contents
 
-- [Why Starforge?](#-why-starforge)
-- [Core Capabilities](#-core-capabilities)
-- [Recent Feature Updates](#-recent-feature-updates)
-- [Quick Start](#-quick-start)
-- [Architecture (High-Level)](#-architecture-high-level)
-- [Memory System](#-memory-system)
-- [Autonomous Loop](#-autonomous-loop)
-- [Fine-Tuning Pipeline](#-fine-tuning-pipeline)
-- [Notes](#notes)
-- [Vision](#-vision)
+- [Starforge](#starforge)
+  - [Table of Contents](#table-of-contents)
+  - [Why Starforge?](#why-starforge)
+  - [Demo](#demo)
+  - [Core Capabilities](#core-capabilities)
+    - [Self-Debugging Loop](#self-debugging-loop)
+    - [Root-Cause Memory](#root-cause-memory)
+    - [Strategy + Skill Learning](#strategy--skill-learning)
+    - [Autonomous Execution](#autonomous-execution)
+    - [State-Aware Learning](#state-aware-learning)
+  - [Recent Feature Updates](#recent-feature-updates)
+  - [What This Means](#what-this-means)
+  - [Quick Start](#quick-start)
+    - [1. Install](#1-install)
+    - [2. Configure](#2-configure)
+    - [3. Run CLI](#3-run-cli)
+    - [4. Run Autonomous Mode](#4-run-autonomous-mode)
+    - [5. Start API Server](#5-start-api-server)
+    - [6. Run One Autonomous Objective And Exit](#6-run-one-autonomous-objective-and-exit)
+  - [Architecture (High-Level)](#architecture-high-level)
+  - [Memory System](#memory-system)
+  - [Autonomous Loop](#autonomous-loop)
+  - [Fine-Tuning Pipeline](#fine-tuning-pipeline)
+  - [Notes](#notes)
+  - [Vision](#vision)
+  - [If you find this interesting](#if-you-find-this-interesting)
 
-## 🧠 Why Starforge?
+## Why Starforge?
 
 Most AI agents:
 
@@ -28,16 +44,20 @@ Most AI agents:
 
 It:
 
-* 🔁 debugs itself (hypothesis → fix → test)
-* 🧠 remembers root causes (not just errors)
-* 📈 improves over time (strategies + skills + trajectories)
-* 🛠 works directly inside your codebase
+* debugs itself (hypothesis → fix → test)
+* remembers root causes (not just errors)
+* improves over time (strategies + skills + trajectories)
+* works directly inside your codebase
 
 ---
 
-## ⚡ Core Capabilities
+## Demo
 
-### 🔍 Self-Debugging Loop
+![Starforge Demo](./assets/demo.gif)
+
+## Core Capabilities
+
+### Self-Debugging Loop
 
 * detects failures
 * generates hypotheses
@@ -47,7 +67,7 @@ It:
 
 ---
 
-### 🧠 Root-Cause Memory
+### Root-Cause Memory
 
 * stores reusable fixes (not just logs)
 * applies deterministic repair templates
@@ -55,7 +75,7 @@ It:
 
 ---
 
-### 🧩 Strategy + Skill Learning
+### Strategy + Skill Learning
 
 * saves successful multi-step plans
 * reuses and adapts them
@@ -63,7 +83,7 @@ It:
 
 ---
 
-### 🔄 Autonomous Execution
+### Autonomous Execution
 
 * DAG-based planning (dependency-aware)
 * execution → validation → scoring → decision
@@ -71,7 +91,7 @@ It:
 
 ---
 
-### 📊 State-Aware Learning
+### State-Aware Learning
 
 Each step tracks:
 
@@ -82,7 +102,7 @@ Each step tracks:
 
 ---
 
-## 🆕 Recent Feature Updates
+## Recent Feature Updates
 
 * **Workspace-aware repo editing**: the assistant now pre-inspects explicit file and folder paths, detects project context before major edits, indexes symbols for large codebases, and uses safer `edit_file` matching when whitespace, trailing newlines, or Unicode punctuation drift from the original text.
 * **More reliable workspace tools**: terminal sessions now use bounded output buffers with truncation reporting and idle cleanup, project search streams `rg` results with safer limits, and shell execution uses a non-login shell for more deterministic behavior inside the repo.
@@ -95,7 +115,7 @@ Each step tracks:
 
 ---
 
-## 🧠 What This Means
+## What This Means
 
 Starforge doesn’t just solve tasks.
 
@@ -107,7 +127,7 @@ Over time, it becomes:
 * more accurate
 * less dependent on trial-and-error
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Install
 
@@ -159,7 +179,7 @@ python3 main.py --autonomous-objective "fix the failing tests" --autonomous-step
 
 ---
 
-## 🏗 Architecture (High-Level)
+## Architecture (High-Level)
 
 * `chat_engine.py` → core loop + autonomous logic
 * `tools.py` → tool dispatcher + reliability layer
@@ -170,7 +190,7 @@ python3 main.py --autonomous-objective "fix the failing tests" --autonomous-step
 
 ---
 
-## 🧠 Memory System
+## Memory System
 
 Starforge uses multiple memory layers:
 
@@ -181,7 +201,7 @@ Starforge uses multiple memory layers:
 
 ---
 
-## 🔁 Autonomous Loop
+## Autonomous Loop
 
 ```
 plan → execute → validate → score → decide
@@ -200,7 +220,7 @@ Includes:
 
 ---
 
-## 🧪 Fine-Tuning Pipeline
+## Fine-Tuning Pipeline
 
 Starforge logs interaction trajectories:
 
@@ -227,7 +247,7 @@ python3 finetune/train_lora_sft.py \
 
 ---
 
-## ⚠️ Notes
+## Notes
 
 * filesystem-based (no database)
 * workspace-root-safe file operations, with `workspaces/<task_name>/` as the default scratch area
@@ -236,7 +256,7 @@ python3 finetune/train_lora_sft.py \
 
 ---
 
-## 🔥 Vision
+## Vision
 
 Starforge is a step toward:
 
@@ -244,6 +264,6 @@ Starforge is a step toward:
 
 ---
 
-## ⭐ If you find this interesting
+## If you find this interesting
 
-Give it a star — it helps a lot 🚀
+Give it a star — it helps a lot
