@@ -1215,36 +1215,70 @@ class WorkspaceTools:
         stdout = str(result.get("stdout", ""))
         stderr = str(result.get("stderr", ""))
         text = f"{stdout}\n{stderr}"
-        parsed = self._parse_test_output(text)
+        parsed = self._parse_test_output(text, exit_code=result.get("exit_code"))
+        exit_code = result.get("exit_code")
+        completed = exit_code is not None and not bool(result.get("timeout", False))
+        tests_passed = bool(
+            completed
+            and int(exit_code or 0) == 0
+            and int(parsed.get("failed", 0) or 0) == 0
+            and int(parsed.get("errors", 0) or 0) == 0
+        )
+        if bool(result.get("timeout", False)):
+            failure_mode = "timeout"
+        elif not completed:
+            failure_mode = "runner_error"
+        elif tests_passed:
+            failure_mode = "none"
+        elif int(parsed.get("collection_errors", 0) or 0) > 0:
+            failure_mode = "collection_error"
+        elif int(parsed.get("failed", 0) or 0) > 0:
+            failure_mode = "assertion_failures"
+        elif bool(parsed.get("unparsed_nonzero_exit", False)):
+            failure_mode = "unparsed_nonzero_exit"
+        else:
+            failure_mode = "runner_error"
+        runner_failed = failure_mode in {
+            "timeout",
+            "runner_error",
+            "collection_error",
+            "unparsed_nonzero_exit",
+        }
 
         return {
-            "ok": bool(result.get("ok", False)),
+            "ok": completed,
+            "completed": completed,
             "runner": selected,
             "command": cmd,
             "path": self._to_workspace_rel(base),
-            "exit_code": result.get("exit_code"),
+            "exit_code": exit_code,
             "duration_ms": result.get("duration_ms"),
             "passed": int(parsed.get("passed", 0) or 0),
             "failed": int(parsed.get("failed", 0) or 0),
             "errors": int(parsed.get("errors", 0) or 0),
             "skipped": int(parsed.get("skipped", 0) or 0),
+            "collection_errors": int(parsed.get("collection_errors", 0) or 0),
             "test_failures": parsed.get("test_failures", []),
-            "tests_passed": bool(
-                result.get("ok", False)
-                and int(parsed.get("failed", 0) or 0) == 0
-                and int(parsed.get("errors", 0) or 0) == 0
-            ),
+            "tests_passed": tests_passed,
+            "runner_failed": runner_failed,
+            "failure_mode": failure_mode,
+            "summary_line": str(parsed.get("summary_line", "")).strip(),
+            "unparsed_nonzero_exit": bool(parsed.get("unparsed_nonzero_exit", False)),
             "stdout": stdout,
             "stderr": stderr,
             "raw": result,
         }
 
     @staticmethod
-    def _parse_test_output(text: str, max_failures: int = 5) -> dict[str, Any]:
+    def _parse_test_output(
+        text: str, exit_code: int | None = None, max_failures: int = 5
+    ) -> dict[str, Any]:
         failed = 0
         passed = 0
         errors = 0
         skipped = 0
+        collection_errors = 0
+        summary_line = ""
         failed_counts = re.findall(r"(?<!\S)(\d+)\s+failed\b", text, flags=re.IGNORECASE)
         passed_counts = re.findall(r"(?<!\S)(\d+)\s+passed\b", text, flags=re.IGNORECASE)
         error_counts = re.findall(r"(?<!\S)(\d+)\s+errors?\b", text, flags=re.IGNORECASE)
@@ -1261,7 +1295,42 @@ class WorkspaceTools:
         failures: list[dict[str, str]] = []
         for raw_line in text.splitlines():
             line = raw_line.strip()
+            if not line:
+                continue
+            lowered = line.lower()
+            if (
+                not summary_line
+                and any(token in lowered for token in (" failed", " passed", " error", " skipped"))
+                and ("=" in line or "collected" in lowered)
+            ):
+                summary_line = line[:320]
             if not line.startswith("FAILED "):
+                if line.startswith("ERROR collecting "):
+                    collection_errors += 1
+                    failures.append(
+                        {
+                            "nodeid": line[len("ERROR collecting ") :].strip(),
+                            "message": "collection error",
+                            "summary": line[:320],
+                            "kind": "collection_error",
+                        }
+                    )
+                elif line.startswith("ERROR "):
+                    body = line[len("ERROR ") :].strip()
+                    nodeid = body
+                    message = ""
+                    if " - " in body:
+                        nodeid, message = body.split(" - ", 1)
+                    failures.append(
+                        {
+                            "nodeid": nodeid.strip(),
+                            "message": message.strip()[:240],
+                            "summary": line[:320],
+                            "kind": "error",
+                        }
+                    )
+                if len(failures) >= max(1, max_failures):
+                    break
                 continue
             body = line[len("FAILED ") :].strip()
             nodeid = body
@@ -1273,10 +1342,19 @@ class WorkspaceTools:
                     "nodeid": nodeid.strip(),
                     "message": message.strip()[:240],
                     "summary": line[:320],
+                    "kind": "failed",
                 }
             )
             if len(failures) >= max(1, max_failures):
                 break
+
+        if failed == 0:
+            failed = sum(1 for item in failures if item.get("kind") == "failed")
+        if errors == 0:
+            errors = (
+                collection_errors
+                + sum(1 for item in failures if item.get("kind") == "error")
+            )
 
         if not failures:
             # Fallback for runners that don't emit pytest-style FAILED lines.
@@ -1291,15 +1369,49 @@ class WorkspaceTools:
                 if len(excerpt_lines) >= max(1, max_failures):
                     break
             failures = [
-                {"nodeid": "", "message": line, "summary": line}
+                {"nodeid": "", "message": line, "summary": line, "kind": "error"}
                 for line in excerpt_lines
             ]
+            if failures and errors == 0:
+                errors = len(failures)
+
+        unparsed_nonzero_exit = False
+        if exit_code not in (None, 0) and failed == 0 and errors == 0:
+            unparsed_nonzero_exit = True
+            errors = 1
+            excerpt = ""
+            for raw_line in text.splitlines():
+                line = raw_line.strip()
+                if line:
+                    excerpt = line[:240]
+                    break
+            failures = [
+                {
+                    "nodeid": "",
+                    "message": excerpt or f"non-zero exit code: {exit_code}",
+                    "summary": "pytest exited non-zero before structured failures were parsed",
+                    "kind": "runner_error",
+                }
+            ]
+
+        if not summary_line:
+            for raw_line in reversed(text.splitlines()):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                lowered = line.lower()
+                if any(token in lowered for token in ("failed", "passed", "error", "skipped")):
+                    summary_line = line[:320]
+                    break
 
         return {
             "passed": passed,
             "failed": failed,
             "errors": errors,
             "skipped": skipped,
+            "collection_errors": collection_errors,
+            "summary_line": summary_line,
+            "unparsed_nonzero_exit": unparsed_nonzero_exit,
             "test_failures": failures,
         }
 
@@ -1332,23 +1444,212 @@ class WorkspaceTools:
             "has_diff": bool(files or additions or deletions),
         }
 
+    @staticmethod
+    def _normalize_workspace_path(path: str) -> str:
+        return Path(str(path or "")).as_posix().lstrip("./")
+
+    def _run_git_command(
+        self, args: list[str], *, path: str = ".", timeout: int = 30
+    ) -> dict[str, Any]:
+        base = self._resolve(path)
+        try:
+            proc = subprocess.run(
+                ["git", *args],
+                cwd=str(base),
+                capture_output=True,
+                text=True,
+                timeout=max(1, int(timeout)),
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "timeout": True, "stdout": "", "stderr": ""}
+        except Exception as e:
+            return {"ok": False, "error": f"git command failed: {e}", "stdout": "", "stderr": ""}
+        return {
+            "ok": proc.returncode == 0,
+            "exit_code": int(proc.returncode),
+            "stdout": proc.stdout or "",
+            "stderr": proc.stderr or "",
+        }
+
+    def _git_status_entries(self, path: str = ".") -> list[dict[str, Any]]:
+        result = self._run_git_command(
+            ["status", "--porcelain", "--untracked-files=all"],
+            path=path,
+            timeout=15,
+        )
+        exit_code = result.get("exit_code")
+        if not isinstance(exit_code, int) or exit_code != 0:
+            return []
+        entries: list[dict[str, Any]] = []
+        for raw_line in str(result.get("stdout", "")).splitlines():
+            line = raw_line.rstrip()
+            if len(line) < 3:
+                continue
+            status = line[:2]
+            payload = line[3:].strip()
+            if not payload:
+                continue
+            if " -> " in payload:
+                _, payload = payload.split(" -> ", 1)
+            entries.append(
+                {
+                    "path": self._normalize_workspace_path(payload),
+                    "staged_status": status[0],
+                    "unstaged_status": status[1],
+                    "untracked": status == "??",
+                }
+            )
+        return entries
+
+    def _git_numstat(self, path: str = ".", staged: bool = False) -> dict[str, tuple[int, int]]:
+        args = ["diff", "--numstat"]
+        if staged:
+            args.append("--staged")
+        result = self._run_git_command(args, path=path, timeout=20)
+        exit_code = result.get("exit_code")
+        if not isinstance(exit_code, int) or exit_code != 0:
+            return {}
+        stats: dict[str, tuple[int, int]] = {}
+        for raw_line in str(result.get("stdout", "")).splitlines():
+            parts = raw_line.split("\t")
+            if len(parts) < 3:
+                continue
+            add_raw, del_raw, file_raw = parts[0], parts[1], parts[2]
+            try:
+                additions = int(add_raw)
+            except Exception:
+                additions = 0
+            try:
+                deletions = int(del_raw)
+            except Exception:
+                deletions = 0
+            stats[self._normalize_workspace_path(file_raw)] = (additions, deletions)
+        return stats
+
+    def _workspace_change_stats(
+        self,
+        path: str = ".",
+        focus_paths: list[str] | None = None,
+    ) -> dict[str, Any]:
+        workspace_files: set[str] = set()
+        untracked_files: set[str] = set()
+        for entry in self._git_status_entries(path=path):
+            file_path = str(entry.get("path", "")).strip()
+            if not file_path:
+                continue
+            workspace_files.add(file_path)
+            if bool(entry.get("untracked", False)):
+                untracked_files.add(file_path)
+
+        unstaged_numstat = self._git_numstat(path=path, staged=False)
+        staged_numstat = self._git_numstat(path=path, staged=True)
+        workspace_files.update(unstaged_numstat.keys())
+        workspace_files.update(staged_numstat.keys())
+
+        focus_set = {
+            self._normalize_workspace_path(item)
+            for item in (focus_paths or [])
+            if str(item).strip()
+        }
+        if focus_set:
+            focused_files = sorted(path for path in workspace_files if path in focus_set)
+        else:
+            focused_files = sorted(workspace_files)
+
+        workspace_additions = 0
+        workspace_deletions = 0
+        for additions, deletions in list(unstaged_numstat.values()) + list(staged_numstat.values()):
+            workspace_additions += additions
+            workspace_deletions += deletions
+
+        focused_additions = 0
+        focused_deletions = 0
+        for file_path in focused_files:
+            for mapping in (unstaged_numstat, staged_numstat):
+                additions, deletions = mapping.get(file_path, (0, 0))
+                focused_additions += additions
+                focused_deletions += deletions
+
+        return {
+            "workspace_changed_file_count": len(workspace_files),
+            "workspace_changed_files": sorted(workspace_files)[:200],
+            "focused_changed_file_count": len(focused_files),
+            "focused_changed_files": focused_files[:200],
+            "workspace_additions": workspace_additions,
+            "workspace_deletions": workspace_deletions,
+            "focused_additions": focused_additions,
+            "focused_deletions": focused_deletions,
+            "has_diff": bool(workspace_files),
+            "focus_applied": bool(focus_set),
+            "focus_paths": sorted(focus_set)[:200],
+            "untracked_files": sorted(untracked_files)[:200],
+        }
+
     def get_git_diff(
-        self, path: str = ".", staged: bool = False, max_chars: int = 12000
+        self,
+        path: str = ".",
+        staged: bool = False,
+        max_chars: int = 12000,
+        paths: list[str] | None = None,
     ) -> dict[str, Any]:
         base = self._resolve(path)
         if not base.exists() or not base.is_dir():
             return {"ok": False, "error": f"not a directory: {path}"}
-        cmd = "git diff --staged" if staged else "git diff"
-        result = self.execute_command(
-            cmd=cmd, path=path, timeout=30, max_output_chars=max_chars
-        )
+        cmd_parts = ["git", "diff"]
+        if staged:
+            cmd_parts.append("--staged")
+        normalized_paths = [
+            self._normalize_workspace_path(item)
+            for item in (paths or [])
+            if str(item).strip()
+        ]
+        if normalized_paths:
+            cmd_parts.append("--")
+            cmd_parts.extend(normalized_paths)
+        started = time.time()
+        try:
+            proc = subprocess.run(
+                cmd_parts,
+                cwd=str(base),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            stdout = proc.stdout or ""
+            stderr = proc.stderr or ""
+            duration_ms = int((time.time() - started) * 1000)
+        except subprocess.TimeoutExpired:
+            return {
+                "ok": False,
+                "path": self._to_workspace_rel(base),
+                "staged": bool(staged),
+                "diff": "",
+                "error": "git diff timed out",
+                "exit_code": None,
+                "paths": normalized_paths,
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "path": self._to_workspace_rel(base),
+                "staged": bool(staged),
+                "diff": "",
+                "error": f"git diff failed: {e}",
+                "exit_code": None,
+                "paths": normalized_paths,
+            }
         return {
-            "ok": bool(result.get("ok", False) or result.get("exit_code", 1) == 0),
+            "ok": int(proc.returncode) == 0,
             "path": self._to_workspace_rel(base),
             "staged": bool(staged),
-            "diff": str(result.get("stdout", "")),
-            "error": result.get("error", ""),
-            "exit_code": result.get("exit_code"),
+            "diff": stdout[:max_chars],
+            "error": stderr[:1000],
+            "exit_code": int(proc.returncode),
+            "truncated": len(stdout) > max_chars,
+            "duration_ms": duration_ms,
+            "paths": normalized_paths,
         }
 
     def validate_workspace_changes(
@@ -1357,8 +1658,15 @@ class WorkspaceTools:
         test_runner: str = "auto",
         test_args: str = "",
         timeout: int = 300,
+        focus_paths: list[str] | None = None,
     ) -> dict[str, Any]:
-        diff_data = self.get_git_diff(path=path, staged=False, max_chars=12000)
+        diff_data = self.get_git_diff(
+            path=path,
+            staged=False,
+            max_chars=4000,
+            paths=focus_paths,
+        )
+        change_stats = self._workspace_change_stats(path=path, focus_paths=focus_paths)
         test_data = self.run_tests(
             path=path,
             runner=test_runner,
@@ -1366,25 +1674,77 @@ class WorkspaceTools:
             timeout=timeout,
         )
         diff_text = str(diff_data.get("diff", ""))
-        diff_stats = self._diff_stats(diff_text)
+        focused_count = int(change_stats.get("focused_changed_file_count", 0) or 0)
+        workspace_count = int(change_stats.get("workspace_changed_file_count", 0) or 0)
         return {
-            "ok": bool(test_data.get("ok", False)),
+            "ok": bool(test_data.get("completed", False)),
             "path": path,
-            "changed_file_count": int(diff_stats.get("changed_file_count", 0) or 0),
-            "changed_files": diff_stats.get("changed_files", []),
-            "diff_stats": diff_stats,
+            "tests_passed": bool(test_data.get("tests_passed", False)),
+            "changed_file_count": focused_count if focus_paths else workspace_count,
+            "changed_files": (
+                change_stats.get("focused_changed_files", [])
+                if focus_paths
+                else change_stats.get("workspace_changed_files", [])
+            ),
+            "focused_changed_file_count": focused_count,
+            "focused_changed_files": change_stats.get("focused_changed_files", []),
+            "workspace_changed_file_count": workspace_count,
+            "workspace_changed_files": change_stats.get("workspace_changed_files", []),
+            "diff_stats": {
+                "changed_file_count": focused_count if focus_paths else workspace_count,
+                "changed_files": (
+                    change_stats.get("focused_changed_files", [])
+                    if focus_paths
+                    else change_stats.get("workspace_changed_files", [])
+                ),
+                "workspace_changed_file_count": workspace_count,
+                "workspace_changed_files": change_stats.get("workspace_changed_files", []),
+                "focused_changed_file_count": focused_count,
+                "focused_changed_files": change_stats.get("focused_changed_files", []),
+                "additions": int(
+                    change_stats.get("focused_additions" if focus_paths else "workspace_additions", 0)
+                    or 0
+                ),
+                "deletions": int(
+                    change_stats.get("focused_deletions" if focus_paths else "workspace_deletions", 0)
+                    or 0
+                ),
+                "has_diff": bool(change_stats.get("has_diff", False)),
+                "focus_applied": bool(change_stats.get("focus_applied", False)),
+                "untracked_files": change_stats.get("untracked_files", []),
+            },
             "tests": test_data,
             "diff_excerpt": diff_text[:4000],
             "validation_signals": {
+                "validation_completed": bool(test_data.get("completed", False)),
                 "tests_passed": bool(test_data.get("tests_passed", False)),
                 "test_exit_code": test_data.get("exit_code"),
                 "failed_tests": int(test_data.get("failed", 0) or 0),
                 "test_errors": int(test_data.get("errors", 0) or 0),
+                "collection_errors": int(test_data.get("collection_errors", 0) or 0),
                 "test_failures": test_data.get("test_failures", []),
-                "has_diff": bool(diff_stats.get("has_diff", False)),
-                "changed_file_count": int(diff_stats.get("changed_file_count", 0) or 0),
-                "diff_additions": int(diff_stats.get("additions", 0) or 0),
-                "diff_deletions": int(diff_stats.get("deletions", 0) or 0),
+                "failure_mode": str(test_data.get("failure_mode", "")).strip(),
+                "summary_line": str(test_data.get("summary_line", "")).strip(),
+                "unparsed_nonzero_exit": bool(
+                    test_data.get("unparsed_nonzero_exit", False)
+                ),
+                "runner_failed": bool(test_data.get("runner_failed", False)),
+                "has_diff": bool(change_stats.get("has_diff", False)),
+                "changed_file_count": focused_count if focus_paths else workspace_count,
+                "focused_changed_file_count": focused_count,
+                "workspace_changed_file_count": workspace_count,
+                "diff_additions": int(
+                    change_stats.get("focused_additions" if focus_paths else "workspace_additions", 0)
+                    or 0
+                ),
+                "diff_deletions": int(
+                    change_stats.get("focused_deletions" if focus_paths else "workspace_deletions", 0)
+                    or 0
+                ),
+                "focus_applied": bool(change_stats.get("focus_applied", False)),
+                "focused_changed_files": change_stats.get("focused_changed_files", []),
+                "workspace_changed_files": change_stats.get("workspace_changed_files", []),
+                "untracked_files": change_stats.get("untracked_files", []),
             },
         }
 

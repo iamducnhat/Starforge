@@ -215,6 +215,8 @@ class ChatEngine:
             "ASSISTANT_LOG_INTERACTIONS", True
         )
         self._autonomous_execution_active = False
+        self._autonomous_tool_result_cache: dict[str, dict[str, Any]] = {}
+        self._autonomous_workspace_epoch = 0
         # Set to a callable (e.g. cli_format.print_phase) to display internal
         # phase labels in the CLI.  Left as None in server mode to stay silent.
         self.on_status: Callable[[str], None] | None = None
@@ -761,6 +763,10 @@ class ChatEngine:
             if isinstance(result, dict):
                 stdout = str(result.get("stdout", "")).strip()
                 stderr = str(result.get("stderr", "")).strip()
+                if bool(result.get("cached", False)):
+                    row["cached"] = True
+                if bool(result.get("duplicate_call", False)):
+                    row["duplicate_call"] = True
                 if stdout:
                     row["stdout_excerpt"] = self._truncate_text(stdout, 240)
                 if stderr:
@@ -867,6 +873,38 @@ class ChatEngine:
 
     @staticmethod
     def _fallback_plan_steps(fallback_goal: str) -> list[PlanStep]:
+        goal_text = str(fallback_goal or "").lower()
+        if "fix" in goal_text and "test" in goal_text:
+            return [
+                PlanStep(
+                    step_id=1,
+                    action="run_tests",
+                    args={"path": ".", "runner": "auto"},
+                    depends_on=[],
+                    expected_output="exact failing tests and error messages",
+                ),
+                PlanStep(
+                    step_id=2,
+                    action="inspect_failing_code_paths",
+                    args={"path": ".", "focus": "failing_tests_only"},
+                    depends_on=[1],
+                    expected_output="suspect files and root cause evidence",
+                ),
+                PlanStep(
+                    step_id=3,
+                    action="apply_minimal_fix",
+                    args={"path": ".", "scope": "smallest_safe_patch"},
+                    depends_on=[2],
+                    expected_output="targeted code patch",
+                ),
+                PlanStep(
+                    step_id=4,
+                    action="validate_with_tests",
+                    args={"path": ".", "runner": "auto"},
+                    depends_on=[3],
+                    expected_output="green tests or concrete remaining failures",
+                ),
+            ]
         return [
             PlanStep(
                 step_id=1,
@@ -1569,17 +1607,30 @@ class ChatEngine:
                 # path-type errors like "not a file"/"not a directory".
                 retry_args = initial_args
             retry_name = initial_name
-            retry_result = self._execute_tool_call_with_policy(
-                user_message, {"name": retry_name, "args": retry_args}
+            same_call = retry_name == initial_name and retry_args == initial_args
+            skip_duplicate_retry = same_call and (
+                retry_name in {"execute_command", "run_tests"}
+                or not bool(result.get("ok", False))
             )
-            reflection["retried"] = True
-            reflection["retry_tool"] = retry_name
-            reflection["retry_ok"] = bool(
-                isinstance(retry_result, dict) and retry_result.get("ok", False)
-            )
-            result = retry_result
-            executed_name = retry_name
-            executed_args = retry_args
+            if skip_duplicate_retry:
+                reflection["retried"] = False
+                reflection["retry_skipped"] = "duplicate_call"
+                reason = str(reflection.get("reason", "")).strip()
+                reflection["reason"] = (
+                    f"{reason} | skipped duplicate retry".strip(" |")
+                )
+            else:
+                retry_result = self._execute_tool_call_with_policy(
+                    user_message, {"name": retry_name, "args": retry_args}
+                )
+                reflection["retried"] = True
+                reflection["retry_tool"] = retry_name
+                reflection["retry_ok"] = bool(
+                    isinstance(retry_result, dict) and retry_result.get("ok", False)
+                )
+                result = retry_result
+                executed_name = retry_name
+                executed_args = retry_args
         else:
             reflection["retried"] = False
 
@@ -1637,13 +1688,44 @@ class ChatEngine:
         state: TaskState,
         step_text: str,
         final_text: str,
+        tool_payloads: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        tool_lines: list[str] = []
+        for payload in (tool_payloads or [])[:6]:
+            if not isinstance(payload, dict):
+                continue
+            tool_name = str(payload.get("tool", "")).strip()
+            args = payload.get("args", {})
+            result = payload.get("result", {})
+            arg_bits: list[str] = []
+            if isinstance(args, dict):
+                for key in ("path", "cmd", "query", "symbol"):
+                    value = str(args.get(key, "")).strip()
+                    if value:
+                        arg_bits.append(f"{key}={value[:80]}")
+            status = "ok" if isinstance(result, dict) and result.get("ok", False) else "fail"
+            flags: list[str] = []
+            if isinstance(result, dict) and result.get("cached", False):
+                flags.append("cached")
+            if isinstance(result, dict) and result.get("duplicate_call", False):
+                flags.append("duplicate")
+            flag_text = f" [{' '.join(flags)}]" if flags else ""
+            tool_lines.append(
+                f"- {tool_name}({', '.join(arg_bits)}) => {status}{flag_text}".rstrip()
+            )
+        recent_tools_text = (
+            "Recent tool calls this step:\n" + "\n".join(tool_lines[:6]) + "\n"
+            if tool_lines
+            else ""
+        )
         prompt = (
             "You are supervising an autonomous coding loop.\n"
             "Return strict JSON with keys:\n"
             "next_action (advance|retry|replan|done|bored), reason (string), confidence (0..1), issues (array), new_steps (array optional).\n"
+            "Do not repeat the same tool call unless the arguments changed or the workspace changed after a file edit.\n"
             f"Goal: {state.goal}\n"
             f"Current step: {step_text}\n"
+            f"{recent_tools_text}"
             f"Latest assistant output: {final_text[:2500]}"
         )
         fallback = {
@@ -1741,6 +1823,8 @@ class ChatEngine:
     ) -> dict[str, Any]:
         name = call["name"]
         args = call.get("args", {})
+        if not isinstance(args, dict):
+            args = {}
         if self._autonomous_execution_active and name in {
             "create_plan",
             "list_plans",
@@ -1769,7 +1853,131 @@ class ChatEngine:
                 "message": "create_function skipped because user asked for copyable function output.",
                 "code": code,
             }
-        return self.tools.execute(name, args)
+        if self._autonomous_execution_active:
+            cached = self._get_autonomous_cached_tool_result(name, args)
+            if cached is not None:
+                return cached
+        result = self.tools.execute(name, args)
+        if self._autonomous_execution_active:
+            self._record_autonomous_tool_result(name, args, result)
+        return result
+
+    @staticmethod
+    def _tool_call_cache_key(name: str, args: dict[str, Any]) -> str:
+        try:
+            args_blob = json.dumps(args, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            args_blob = str(args)
+        return f"{str(name or '').strip().lower()}::{args_blob}"
+
+    @staticmethod
+    def _is_read_only_execute_command(cmd: str) -> bool:
+        text = str(cmd or "").strip().lower()
+        if not text:
+            return False
+        mutating_markers = (
+            " -i ",
+            ">",
+            ">>",
+            " tee ",
+            " rm ",
+            " mv ",
+            " cp ",
+            " touch ",
+            " mkdir ",
+            "git apply",
+            "git checkout",
+            "chmod ",
+            "chown ",
+        )
+        if any(marker in f" {text} " for marker in mutating_markers):
+            return False
+        read_only_prefixes = (
+            "pytest",
+            "python -m pytest",
+            "python3 -m pytest",
+            "npm test",
+            "go test",
+            "cargo test",
+            "git diff",
+            "git status",
+            "git grep",
+            "rg ",
+            "ls",
+            "find ",
+            "cat ",
+            "sed -n",
+            "head ",
+            "tail ",
+        )
+        return text.startswith(read_only_prefixes)
+
+    def _is_cacheable_autonomous_tool_call(self, name: str, args: dict[str, Any]) -> bool:
+        tool_name = str(name or "").strip()
+        if tool_name in {
+            "list_files",
+            "read_file",
+            "search_project",
+            "lookup_symbol",
+            "summarize_file",
+            "detect_project_context",
+            "index_symbols",
+            "run_tests",
+            "get_git_diff",
+            "validate_workspace_changes",
+        }:
+            return True
+        if tool_name == "execute_command":
+            return self._is_read_only_execute_command(str(args.get("cmd", "")))
+        return False
+
+    def _get_autonomous_cached_tool_result(
+        self, name: str, args: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        if not self._is_cacheable_autonomous_tool_call(name, args):
+            return None
+        cache_key = self._tool_call_cache_key(name, args)
+        entry = self._autonomous_tool_result_cache.get(cache_key)
+        if not isinstance(entry, dict):
+            return None
+        cached_epoch = entry.get("workspace_epoch", -1)
+        if not isinstance(cached_epoch, int) or cached_epoch != self._autonomous_workspace_epoch:
+            return None
+        cached_result = entry.get("result")
+        if not isinstance(cached_result, dict):
+            return None
+        out = dict(cached_result)
+        out["cached"] = True
+        out["duplicate_call"] = True
+        out["workspace_epoch"] = self._autonomous_workspace_epoch
+        return out
+
+    def _record_autonomous_tool_result(
+        self, name: str, args: dict[str, Any], result: dict[str, Any]
+    ) -> None:
+        if self._did_autonomous_workspace_change(name, result):
+            self._autonomous_workspace_epoch += 1
+            self._autonomous_tool_result_cache.clear()
+            return
+        if not isinstance(result, dict) or not self._is_cacheable_autonomous_tool_call(name, args):
+            return
+        cache_key = self._tool_call_cache_key(name, args)
+        self._autonomous_tool_result_cache[cache_key] = {
+            "workspace_epoch": self._autonomous_workspace_epoch,
+            "result": dict(result),
+        }
+
+    @staticmethod
+    def _did_autonomous_workspace_change(name: str, result: dict[str, Any]) -> bool:
+        if not isinstance(result, dict) or not result.get("ok", False):
+            return False
+        return str(name or "").strip() in {
+            "edit_file",
+            "create_file",
+            "write_file",
+            "delete_file",
+            "create_folder",
+        }
 
     @staticmethod
     def _extract_keywords(text: str, limit: int = 6) -> list[str]:
@@ -3363,6 +3571,8 @@ class ChatEngine:
         }
         i = 0
         self._autonomous_execution_active = True
+        self._autonomous_tool_result_cache.clear()
+        self._autonomous_workspace_epoch = 0
         try:
             while True:
                 self._maybe_enforce_memory_limits(context="autonomous:loop")
@@ -3547,6 +3757,7 @@ class ChatEngine:
                     state=state,
                     step_text=current_step.short_label(),
                     final_text=final_text,
+                    tool_payloads=tool_payloads,
                 )
                 action = str(progress.get("next_action", "advance")).lower()
                 reason = str(progress.get("reason", "")).strip()
@@ -3774,6 +3985,7 @@ class ChatEngine:
             return
         finally:
             self._autonomous_execution_active = False
+            self._autonomous_tool_result_cache.clear()
 
     def _recent_tool_payloads(self, limit: int = 8) -> list[dict[str, Any]]:
         payloads: list[dict[str, Any]] = []
@@ -3980,7 +4192,8 @@ class ChatEngine:
             "test_runs": [],
             "diff_observed": False,
             "changed_file_count": 0,
-            "workspace_validation_ok": None,
+            "workspace_validation_completed": None,
+            "failure_modes": [],
         }
         for payload in tool_payloads:
             result = payload.get("result", {})
@@ -3999,12 +4212,17 @@ class ChatEngine:
                 signals["test_runs"].append(
                     {
                         "ok": bool(result.get("ok", False)),
+                        "completed": bool(result.get("completed", result.get("ok", False))),
                         "exit_code": result.get("exit_code"),
                         "failed": int(result.get("failed", 0) or 0),
                         "errors": int(result.get("errors", 0) or 0),
                         "passed": int(result.get("passed", 0) or 0),
+                        "failure_mode": str(result.get("failure_mode", "")).strip(),
                     }
                 )
+                failure_mode = str(result.get("failure_mode", "")).strip()
+                if failure_mode:
+                    signals["failure_modes"].append(failure_mode)
 
             if tool_name == "get_git_diff" and isinstance(result, dict):
                 diff_text = str(result.get("diff", ""))
@@ -4016,9 +4234,17 @@ class ChatEngine:
                     )
 
         if isinstance(workspace_validation, dict):
-            signals["workspace_validation_ok"] = bool(
-                workspace_validation.get("ok", False)
-            )
+            validation_signals = workspace_validation.get("validation_signals", {})
+            if isinstance(validation_signals, dict):
+                signals["workspace_validation_completed"] = bool(
+                    validation_signals.get(
+                        "validation_completed", workspace_validation.get("ok", False)
+                    )
+                )
+            else:
+                signals["workspace_validation_completed"] = bool(
+                    workspace_validation.get("ok", False)
+                )
             validation_signals = workspace_validation.get("validation_signals", {})
             if isinstance(validation_signals, dict):
                 signals["diff_observed"] = bool(
@@ -4031,9 +4257,15 @@ class ChatEngine:
                 exit_code = validation_signals.get("test_exit_code")
                 if isinstance(exit_code, int):
                     signals["command_exit_codes"].append(exit_code)
+                failure_mode = str(validation_signals.get("failure_mode", "")).strip()
+                if failure_mode:
+                    signals["failure_modes"].append(failure_mode)
                 signals["test_runs"].append(
                     {
                         "ok": bool(validation_signals.get("tests_passed", False)),
+                        "completed": bool(
+                            validation_signals.get("validation_completed", True)
+                        ),
                         "exit_code": exit_code,
                         "failed": int(validation_signals.get("failed_tests", 0) or 0),
                         "errors": int(validation_signals.get("test_errors", 0) or 0),
@@ -4042,6 +4274,7 @@ class ChatEngine:
                         )
                         if isinstance(workspace_validation.get("tests"), dict)
                         else 0,
+                        "failure_mode": failure_mode,
                     }
                 )
 
@@ -4103,13 +4336,30 @@ class ChatEngine:
                 exit_code = run.get("exit_code")
                 failed = int(run.get("failed", 0) or 0)
                 errors = int(run.get("errors", 0) or 0)
+                failure_mode = str(run.get("failure_mode", "")).strip()
+                completed = bool(run.get("completed", True))
                 run_ok = bool(run.get("ok", False)) and failed == 0 and errors == 0
                 if run_ok:
                     successful_runs += 1
                 else:
-                    issues.append(
-                        f"tests failed (exit_code={exit_code}, failed={failed}, errors={errors})"
-                    )
+                    if not completed:
+                        issues.append("workspace validation did not complete")
+                    elif failure_mode == "collection_error":
+                        issues.append("pytest collection failed")
+                    elif failure_mode == "unparsed_nonzero_exit":
+                        issues.append(
+                            "test runner exited non-zero without structured failure counts"
+                        )
+                    elif failure_mode == "timeout":
+                        issues.append("validation timed out")
+                    elif failure_mode == "assertion_failures":
+                        issues.append(
+                            f"tests reported assertion failures (failed={failed}, errors={errors})"
+                        )
+                    else:
+                        issues.append(
+                            f"test runner failed (exit_code={exit_code}, failed={failed}, errors={errors})"
+                        )
             score += 0.35 * (successful_runs / max(1, len(test_runs)))
         elif signals.get("expects_workspace_change", False):
             issues.append("no test or validation evidence captured for code-changing step")
@@ -4137,11 +4387,11 @@ class ChatEngine:
             else:
                 issues.append("expected workspace diff was not observed")
 
-        workspace_ok = signals.get("workspace_validation_ok")
-        if workspace_ok is True:
+        workspace_completed = signals.get("workspace_validation_completed")
+        if workspace_completed is True:
             score += 0.1
-        elif workspace_ok is False:
-            issues.append("workspace validation failed")
+        elif workspace_completed is False:
+            issues.append("workspace validation did not complete")
 
         failure_markers = (
             "error",
@@ -4188,6 +4438,28 @@ class ChatEngine:
                 names.append(name)
         return names
 
+    @staticmethod
+    def _focus_paths_from_payloads(payloads: list[dict[str, Any]]) -> list[str]:
+        mutating_tools = {"edit_file", "create_file", "write_file", "delete_file"}
+        focused: list[str] = []
+        seen = set()
+        for preferred_tools in (mutating_tools, {"read_file"}):
+            for payload in payloads:
+                tool_name = str(payload.get("tool", "")).strip()
+                if tool_name not in preferred_tools:
+                    continue
+                args = payload.get("args", {})
+                if not isinstance(args, dict):
+                    continue
+                path = str(args.get("path", "")).strip()
+                if not path or path in seen:
+                    continue
+                focused.append(path)
+                seen.add(path)
+            if focused:
+                break
+        return focused[:20]
+
     def _should_run_validation_tests(
         self, step: PlanStep, payloads: list[dict[str, Any]]
     ) -> bool:
@@ -4224,7 +4496,13 @@ class ChatEngine:
             if detected_runner and detected_runner.lower() != "unknown":
                 runner = detected_runner
 
-        args = {"path": ".", "test_runner": runner, "test_args": "", "timeout": 180}
+        args = {
+            "path": ".",
+            "test_runner": runner,
+            "test_args": "",
+            "timeout": 180,
+            "focus_paths": self._focus_paths_from_payloads(payloads),
+        }
         print_tool_start("validate_workspace_changes", args)
         result = self.tools.execute("validate_workspace_changes", args)
         print_tool_event("validate_workspace_changes", args, result)
@@ -4451,6 +4729,237 @@ class ChatEngine:
                 name = "execute_command"
                 normalized_args = {"cmd": cmd, "path": ".", "timeout": 180}
         return name, normalized_args
+
+    @staticmethod
+    def _module_name_to_path(module_name: str) -> str:
+        normalized = str(module_name or "").strip().replace(".", "/")
+        if not normalized:
+            return ""
+        return f"{normalized}.py"
+
+    @staticmethod
+    def _operator_hint_from_name(name: str) -> str | None:
+        lowered = str(name or "").strip().lower()
+        if not lowered:
+            return None
+        if any(token in lowered for token in ("add", "sum", "plus", "increment")):
+            return "+"
+        if any(token in lowered for token in ("sub", "minus", "subtract", "decrement")):
+            return "-"
+        if any(token in lowered for token in ("mul", "product", "times", "multiply")):
+            return "*"
+        if any(token in lowered for token in ("div", "quotient", "divide")):
+            return "/"
+        return None
+
+    @classmethod
+    def _extract_imported_function_paths(cls, test_content: str) -> dict[str, str]:
+        mapping: dict[str, str] = {}
+        for module_name, names_blob in re.findall(
+            r"^\s*from\s+([A-Za-z0-9_\.]+)\s+import\s+([A-Za-z0-9_,\s]+)",
+            test_content,
+            flags=re.MULTILINE,
+        ):
+            module_path = cls._module_name_to_path(module_name)
+            if not module_path:
+                continue
+            for raw_name in names_blob.split(","):
+                name = raw_name.strip()
+                if name and name != "*":
+                    mapping[name] = module_path
+        return mapping
+
+    @staticmethod
+    def _extract_test_assert_targets(test_content: str) -> list[str]:
+        targets: list[str] = []
+        seen = set()
+        for match in re.finditer(
+            r"assert\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+            test_content,
+        ):
+            func_name = str(match.group(1)).strip()
+            if func_name and func_name not in seen:
+                targets.append(func_name)
+                seen.add(func_name)
+        return targets
+
+    @staticmethod
+    def _find_simple_return_line(content: str, func_name: str) -> dict[str, str] | None:
+        lines = content.splitlines()
+        in_function = False
+        function_indent = 0
+        for line in lines:
+            def_match = re.match(
+                rf"^([ \t]*)def\s+{re.escape(func_name)}\s*\(",
+                line,
+            )
+            if def_match:
+                in_function = True
+                function_indent = len(def_match.group(1))
+                continue
+            if not in_function:
+                continue
+            if line.strip() and len(line) - len(line.lstrip(" \t")) <= function_indent:
+                break
+            return_match = re.match(
+                r"^([ \t]*)return\s+([A-Za-z_][A-Za-z0-9_]*)\s*([+\-*/])\s*([A-Za-z_][A-Za-z0-9_]*)((?:\s+#.*)?)$",
+                line,
+            )
+            if return_match:
+                return {
+                    "line": line,
+                    "indent": return_match.group(1),
+                    "left": return_match.group(2),
+                    "operator": return_match.group(3),
+                    "right": return_match.group(4),
+                    "suffix": return_match.group(5) or "",
+                }
+        return None
+
+    def _maybe_apply_immediate_fix_from_observation(
+        self,
+        step: PlanStep,
+        workspace_validation: dict[str, Any] | None,
+        current_tool_payloads: list[dict[str, Any]],
+        project_context: dict[str, Any],
+        auto_metrics: dict[str, Any],
+    ) -> tuple[bool, list[dict[str, Any]], dict[str, Any] | None, dict[str, Any] | None]:
+        del step
+        read_results: list[dict[str, str]] = []
+        for payload in current_tool_payloads:
+            if not isinstance(payload, dict) or str(payload.get("tool", "")).strip() != "read_file":
+                continue
+            result = payload.get("result", {})
+            if not isinstance(result, dict) or not result.get("ok", False):
+                continue
+            path = str(result.get("path", "") or payload.get("args", {}).get("path", "")).strip()
+            content = str(result.get("content", "")).strip()
+            if path and content:
+                read_results.append({"path": path, "content": content})
+        if not read_results:
+            return False, [], workspace_validation, None
+
+        failure_text = self._extract_root_cause_error_text(
+            workspace_validation,
+            tool_payloads=current_tool_payloads,
+        ).lower()
+        if not failure_text or "assert" not in failure_text:
+            return False, [], workspace_validation, None
+
+        failure_nodeids: list[str] = []
+        signals = self._workspace_validation_signals(workspace_validation)
+        raw_failures = signals.get("test_failures", [])
+        if isinstance(raw_failures, list):
+            for item in raw_failures:
+                if not isinstance(item, dict):
+                    continue
+                nodeid = str(item.get("nodeid", "")).strip()
+                if nodeid:
+                    failure_nodeids.append(nodeid)
+
+        candidate_tests: list[dict[str, str]] = []
+        for item in read_results:
+            path = item["path"]
+            if "/test" in path or path.startswith("test") or "assert " in item["content"]:
+                if not failure_nodeids or any(nodeid.startswith(path) for nodeid in failure_nodeids):
+                    candidate_tests.append(item)
+        if not candidate_tests:
+            candidate_tests = [item for item in read_results if "assert " in item["content"]]
+        candidate_sources = [
+            item
+            for item in read_results
+            if item not in candidate_tests and not ("/test" in item["path"] or item["path"].startswith("test"))
+        ]
+        if not candidate_tests or not candidate_sources:
+            return False, [], workspace_validation, None
+
+        patch_candidates: list[dict[str, Any]] = []
+        for test_item in candidate_tests:
+            imported_paths = self._extract_imported_function_paths(test_item["content"])
+            for func_name in self._extract_test_assert_targets(test_item["content"]):
+                expected_operator = self._operator_hint_from_name(func_name)
+                if not expected_operator:
+                    continue
+                preferred_path = imported_paths.get(func_name, "")
+                source_pool = candidate_sources
+                if preferred_path:
+                    source_pool = [
+                        item for item in candidate_sources if item["path"].endswith(preferred_path)
+                    ] or source_pool
+                for source_item in source_pool:
+                    return_line = self._find_simple_return_line(
+                        source_item["content"], func_name
+                    )
+                    if return_line is None:
+                        continue
+                    current_operator = str(return_line.get("operator", "")).strip()
+                    if not current_operator or current_operator == expected_operator:
+                        continue
+                    replacement = (
+                        f"{return_line['indent']}return {return_line['left']} "
+                        f"{expected_operator} {return_line['right']}{return_line['suffix']}"
+                    )
+                    patch_candidates.append(
+                        {
+                            "path": source_item["path"],
+                            "find_text": return_line["line"],
+                            "replace_text": replacement,
+                            "function_name": func_name,
+                        }
+                    )
+
+        if len(patch_candidates) != 1:
+            return False, [], workspace_validation, None
+
+        candidate = patch_candidates[0]
+        print(
+            "[auto] immediate fix trigger: "
+            f"{candidate['function_name']} operator mismatch in {candidate['path']}"
+        )
+        args = {
+            "path": candidate["path"],
+            "find_text": candidate["find_text"],
+            "replace_text": candidate["replace_text"],
+        }
+        result = self.tools.execute("edit_file", args)
+        payload = {
+            "tool": "edit_file",
+            "args": args,
+            "result": result,
+            "source": "immediate_fix",
+        }
+        auto_metrics["tool_calls"] = int(auto_metrics.get("tool_calls", 0) or 0) + 1
+        if not (isinstance(result, dict) and result.get("ok", False)):
+            auto_metrics["failed_tool_calls"] = int(
+                auto_metrics.get("failed_tool_calls", 0) or 0
+            ) + 1
+            history_item = {
+                "attempt": 0,
+                "kind": "immediate_fix",
+                "hypothesis": f"fix operator mismatch in {candidate['function_name']}",
+                "result": "failed",
+                "outcome": "unchanged",
+                "fix_signature": self._repair_fix_signature([payload]),
+            }
+            return False, [payload], workspace_validation, history_item
+
+        updated_validation = self._maybe_validate_workspace_after_step(
+            step=PlanStep(step_id=0, action="apply immediate fix"),
+            project_context=project_context,
+            payloads=[payload],
+        )
+        solved = bool(
+            self._workspace_validation_signals(updated_validation).get("tests_passed", False)
+        )
+        history_item = {
+            "attempt": 0,
+            "kind": "immediate_fix",
+            "hypothesis": f"fix operator mismatch in {candidate['function_name']}",
+            "result": "success" if solved else "failed",
+            "outcome": "resolved" if solved else "unchanged",
+            "fix_signature": self._repair_fix_signature([payload]),
+        }
+        return solved, [payload], updated_validation, history_item
 
     def _maybe_apply_root_cause_fix(
         self,
@@ -4781,6 +5290,23 @@ class ChatEngine:
         repair_history: list[dict[str, Any]] = []
         repair_state = RepairState()
         improving_fix_signatures: set[str] = set()
+
+        solved_immediately, immediate_payloads, validation, immediate_history = (
+            self._maybe_apply_immediate_fix_from_observation(
+                step=step,
+                workspace_validation=validation,
+                current_tool_payloads=combined_payloads,
+                project_context=project_context,
+                auto_metrics=auto_metrics,
+            )
+        )
+        if immediate_payloads:
+            combined_payloads.extend(immediate_payloads)
+        if immediate_history:
+            repair_history.append(immediate_history)
+        if solved_immediately:
+            latest_text = "Applied an immediate deterministic fix from the observed failure and tests are now passing."
+            return latest_text, combined_payloads, validation, repair_history
 
         # Root-cause first-pass: deterministic fix templates before model-driven repair.
         solved_by_root_cause, root_payloads, validation, root_history = self._maybe_apply_root_cause_fix(

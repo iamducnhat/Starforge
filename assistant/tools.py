@@ -788,10 +788,17 @@ class ToolSystem:
         )
 
     def get_git_diff(
-        self, path: str = ".", staged: bool = False, max_chars: int = 12000
+        self,
+        path: str = ".",
+        staged: bool = False,
+        max_chars: int = 12000,
+        paths: list[str] | None = None,
     ) -> dict[str, Any]:
         return self.workspace_tools.get_git_diff(
-            path=path, staged=staged, max_chars=max_chars
+            path=path,
+            staged=staged,
+            max_chars=max_chars,
+            paths=paths,
         )
 
     def validate_workspace_changes(
@@ -800,12 +807,14 @@ class ToolSystem:
         test_runner: str = "auto",
         test_args: str = "",
         timeout: int = 300,
+        focus_paths: list[str] | None = None,
     ) -> dict[str, Any]:
         return self.workspace_tools.validate_workspace_changes(
             path=path,
             test_runner=test_runner,
             test_args=test_args,
             timeout=timeout,
+            focus_paths=focus_paths,
         )
 
     def create_plan(self, title: str, goal: str, steps: list[str]) -> dict[str, Any]:

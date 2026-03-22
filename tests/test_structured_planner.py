@@ -45,6 +45,32 @@ class _CaptureTools:
         return {"ok": True, "name": name}
 
 
+class _ImmediateFixTools:
+    def __init__(self):
+        self.calls = []
+        self.memory_store = None
+
+    def execute(self, name, args):
+        self.calls.append((name, args))
+        if name == "edit_file":
+            return {"ok": True, "path": args.get("path", ""), "replacements": 1}
+        if name == "validate_workspace_changes":
+            return {
+                "ok": True,
+                "tests_passed": True,
+                "changed_files": [args.get("focus_paths", [""])[0]],
+                "validation_signals": {
+                    "validation_completed": True,
+                    "tests_passed": True,
+                    "failed_tests": 0,
+                    "test_errors": 0,
+                    "has_diff": True,
+                    "changed_file_count": 1,
+                },
+            }
+        return {"ok": True}
+
+
 class _StubLearningStore:
     def __init__(self, matches=None):
         self.matches = matches or []
@@ -278,18 +304,14 @@ class TestStructuredPlanner(unittest.TestCase):
             },
         )
 
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["name"], "read_file")
-        self.assertEqual(calls[1]["name"], "read_file")
-        self.assertEqual(
-            calls[1]["args"],
-            {"path": "workspaces/crypto_research/FINAL_RANKING_MARCH_APRIL_2026.md"},
-        )
         self.assertEqual(
             executed.get("args"),
             {"path": "workspaces/crypto_research/FINAL_RANKING_MARCH_APRIL_2026.md"},
         )
         self.assertEqual(executed["reflection"].get("retry_name_ignored"), "list_files")
+        self.assertEqual(executed["reflection"].get("retry_skipped"), "duplicate_call")
 
     def test_retry_accepts_revised_args_when_tool_name_matches(self):
         engine = ChatEngine(
@@ -341,6 +363,161 @@ class TestStructuredPlanner(unittest.TestCase):
             executed.get("args"),
             {"path": "workspaces/crypto_research/FINAL_RANKING_MARCH_APRIL_2026.md"},
         )
+
+    def test_autonomous_policy_caches_duplicate_reads(self):
+        tools = _CaptureTools()
+        engine = ChatEngine(
+            model=_DummyModel(),
+            tools=tools,
+            system_prompt="test",
+        )
+        engine._autonomous_execution_active = True
+
+        first = engine._execute_tool_call_with_policy(
+            "read file",
+            {"name": "read_file", "args": {"path": "README.md"}},
+        )
+        second = engine._execute_tool_call_with_policy(
+            "read file",
+            {"name": "read_file", "args": {"path": "README.md"}},
+        )
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertTrue(second.get("cached"))
+        self.assertEqual(tools.calls, [("read_file", {"path": "README.md"})])
+
+    def test_retry_skips_duplicate_failing_execute_command(self):
+        engine = ChatEngine(
+            model=_DummyModel(),
+            tools=_DummyTools(),
+            system_prompt="test",
+        )
+
+        calls = []
+
+        def _fake_execute_tool_call_with_policy(user_message, call):
+            calls.append(call)
+            return {"ok": False, "exit_code": 1, "stderr": "tests failed"}
+
+        def _fake_reflect_tool_result(user_message, call, result):
+            return {
+                "enabled": True,
+                "status": "failed",
+                "retry": True,
+                "succeeded": False,
+                "confidence": 0.2,
+                "issues": [],
+                "reason": "retry pytest",
+                "revised_call": {"name": "execute_command", "args": dict(call.get("args", {}))},
+            }
+
+        engine._execute_tool_call_with_policy = _fake_execute_tool_call_with_policy
+        engine._reflect_tool_result = _fake_reflect_tool_result
+
+        executed = engine._run_tool_call_with_reflection(
+            "run tests",
+            {"name": "execute_command", "args": {"cmd": "pytest -q demo_project/tests"}},
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(executed["reflection"].get("retry_skipped"), "duplicate_call")
+
+    def test_collect_validation_signals_tracks_validation_completed_separately(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        signals = engine._collect_validation_signals(
+            step=PlanStep(step_id=1, action="implement fix"),
+            tool_payloads=[],
+            workspace_validation={
+                "ok": True,
+                "tests_passed": False,
+                "validation_signals": {
+                    "validation_completed": True,
+                    "tests_passed": False,
+                    "failed_tests": 1,
+                    "test_errors": 0,
+                    "failure_mode": "assertion_failures",
+                    "has_diff": True,
+                    "changed_file_count": 1,
+                },
+            },
+        )
+        self.assertTrue(signals["workspace_validation_completed"])
+        self.assertIn("assertion_failures", signals["failure_modes"])
+
+    def test_validator_reports_collection_error_not_zero_counts_noise(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        validation = engine._validate_autonomous_step_execution(
+            step=PlanStep(step_id=1, action="implement fix"),
+            final_text="Tried to fix it.",
+            tool_payloads=[],
+            workspace_validation={
+                "ok": True,
+                "validation_signals": {
+                    "validation_completed": True,
+                    "tests_passed": False,
+                    "failed_tests": 0,
+                    "test_errors": 1,
+                    "failure_mode": "collection_error",
+                    "has_diff": True,
+                    "changed_file_count": 1,
+                },
+            },
+        )
+        self.assertIn("pytest collection failed", validation["issues"])
+
+    def test_immediate_fix_trigger_patches_operator_mismatch(self):
+        tools = _ImmediateFixTools()
+        engine = ChatEngine(
+            model=_DummyModel(),
+            tools=tools,
+            system_prompt="test",
+        )
+        solved, payloads, validation, history = engine._maybe_apply_immediate_fix_from_observation(
+            step=PlanStep(step_id=1, action="inspect failing tests"),
+            workspace_validation={
+                "validation_signals": {
+                    "validation_completed": True,
+                    "tests_passed": False,
+                    "failed_tests": 1,
+                    "test_errors": 0,
+                    "test_failures": [
+                        {
+                            "nodeid": "demo_project/tests/test_main.py::test_add",
+                            "message": "AssertionError: assert -1 == 5",
+                            "summary": "FAILED demo_project/tests/test_main.py::test_add - AssertionError: assert -1 == 5",
+                        }
+                    ],
+                }
+            },
+            current_tool_payloads=[
+                {
+                    "tool": "read_file",
+                    "args": {"path": "demo_project/tests/test_main.py"},
+                    "result": {
+                        "ok": True,
+                        "path": "demo_project/tests/test_main.py",
+                        "content": "from demo_project.utils import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+                    },
+                },
+                {
+                    "tool": "read_file",
+                    "args": {"path": "demo_project/utils.py"},
+                    "result": {
+                        "ok": True,
+                        "path": "demo_project/utils.py",
+                        "content": "def add(a: int, b: int) -> int:\n    return a - b  # BUG\n",
+                    },
+                },
+            ],
+            project_context={"test_runner": "pytest"},
+            auto_metrics={"tool_calls": 0, "failed_tool_calls": 0},
+        )
+        self.assertTrue(solved)
+        self.assertEqual(payloads[0]["tool"], "edit_file")
+        self.assertEqual(payloads[0]["args"]["path"], "demo_project/utils.py")
+        self.assertTrue(validation["validation_signals"]["tests_passed"])
+        self.assertEqual(history["kind"], "immediate_fix")
 
     def test_coerce_structured_plan(self):
         payload = {

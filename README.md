@@ -86,7 +86,9 @@ Each step tracks:
 
 * **Workspace-aware repo editing**: the assistant now pre-inspects explicit file and folder paths, detects project context before major edits, indexes symbols for large codebases, and uses safer `edit_file` matching when whitespace, trailing newlines, or Unicode punctuation drift from the original text.
 * **More reliable workspace tools**: terminal sessions now use bounded output buffers with truncation reporting and idle cleanup, project search streams `rg` results with safer limits, and shell execution uses a non-login shell for more deterministic behavior inside the repo.
-* **Stronger autonomous convergence controls**: autonomous runs skip plan/todo mutation tools during execution, track validation signals and test-failure snapshots, preserve completed steps across replans, and enforce retry, replan, no-progress, and tool-call budgets to avoid unbounded loops.
+* **Stronger autonomous convergence controls**: autonomous runs skip plan/todo mutation tools during execution, cache duplicate read/test calls until the workspace changes, suppress blind retries of identical failing commands, track validation signals and test-failure snapshots, preserve completed steps across replans, and enforce retry, replan, no-progress, and tool-call budgets to avoid unbounded loops.
+* **Faster deterministic repair triggers**: when Starforge already has the failing assertion, the implicated test, and the buggy source line in hand, it can apply a same-loop immediate fix instead of burning extra inspection turns before patching.
+* **Higher-signal validation**: workspace validation now separates “validation completed” from “tests passed”, classifies collection errors and unparsed non-zero exits more clearly, includes untracked/staged changes, and can focus diff reporting on the files touched by the current step instead of the whole dirty repo.
 * **Runtime guardrails for long sessions**: the engine now compacts oversized history entries, clips large tool payloads before storing them in context, and applies a memory guard that can evict cold memory/skill state, close idle terminals, clear DNS cache, and stop runs that exceed a hard memory limit.
 * **Richer learned skills and memory reuse**: auto-learned skills can now store structured metadata such as `skill`, `inputs`, `steps_template`, and `match_conditions`, while hot caches for strategies, knowledge blocks, root causes, and skills are ranked and trimmed for reuse.
 * **API and research upgrades**: streamed API responses now handle disconnects and queue backpressure more cleanly, streamed usage accounting is available when requested, web search can persist results on demand, and `--autonomous-objective` supports one-shot autonomous runs from the CLI.
@@ -189,8 +191,11 @@ Includes:
 
 * dependency-aware execution
 * project-context bootstrap + workspace preinspection
+* duplicate tool-call suppression for repeated reads and test commands
+* same-loop immediate-fix heuristics for simple high-confidence bugs
 * validator-driven retry / replan gating
-* test-driven repair loop + root-cause fast-path fixes
+* focused workspace validation with explicit failure modes
+* test-driven repair loop + root-cause and deterministic fast-path fixes
 * convergence controller with retry, replan, and no-progress limits
 
 ---
